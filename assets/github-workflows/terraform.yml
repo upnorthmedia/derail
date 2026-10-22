@@ -1,0 +1,211 @@
+# Terraform CI for one root: plan on pull requests, apply on push to main.
+#
+# Required repository variables (Settings -> Secrets and variables -> Actions -> Variables):
+#   AWS_REGION          e.g. us-east-1
+#   TF_ROOT             path of the root in this repo, e.g. infra/live/acme-app/prod
+#   TF_PLAN_ROLE_ARN    output github_plan_role_arn of that root (read-only + state)
+#   TF_APPLY_ROLE_ARN   output github_apply_role_arn of that root
+# Optional repository variables:
+#   TF_VERSION          Terraform version, default 1.17.0
+#   TF_ENVIRONMENT      GitHub Environment name used by the apply job, default "prod"
+#                       (required reviewers on Environments are Enterprise-only for private
+#                       repos; otherwise the gate is protected main + PR review)
+#   TFLINT_VERSION      default latest
+#   INFRA_DIR           directory that holds .tflint.hcl and the modules, default "infra"
+# No secrets are needed: authentication is OpenID Connect to the roles above.
+#
+# Copy this file to .github/workflows/terraform.yml. One copy per root; change
+# `name`, the `paths` filters and the variables if you add more roots.
+
+name: terraform
+
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch: # manual apply button (useful when Environments cannot gate)
+
+permissions:
+  id-token: write # OIDC token for AWS
+  contents: read
+  pull-requests: write # plan comment
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
+  TF_ROOT: ${{ vars.TF_ROOT }}
+  TF_VERSION: ${{ vars.TF_VERSION || '1.17.0' }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  INFRA_DIR: ${{ vars.INFRA_DIR || 'infra' }}
+
+jobs:
+  plan:
+    name: plan
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ vars.TF_ROOT }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false # plain stdout so we can tee the plan
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.TF_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-plan-${{ github.run_id }}
+
+      # -lockfile=readonly: fail if .terraform.lock.hcl is stale instead of
+      # silently upgrading providers in CI.
+      - name: terraform init
+        run: terraform init -lockfile=readonly
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform validate
+        run: terraform validate
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ vars.TFLINT_VERSION || 'latest' }}
+
+      - name: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids rate limits when tflint downloads the AWS ruleset
+        run: |
+          tflint --init --config "${GITHUB_WORKSPACE}/${INFRA_DIR}/.tflint.hcl"
+          tflint --recursive --config "${GITHUB_WORKSPACE}/${INFRA_DIR}/.tflint.hcl" --format compact
+
+      - name: trivy config scan
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: config
+          scan-ref: ${{ env.INFRA_DIR }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          skip-dirs: "**/.terraform"
+
+      # Keep the image that is currently deployed: Terraform owns image_tag, and
+      # an infra-only plan must not propose rolling the app back to the default.
+      - name: resolve deployed image tag
+        id: image
+        run: |
+          tag="$(terraform output -raw image_tag 2>/dev/null || true)"
+          echo "tag=${tag:-bootstrap}" >> "$GITHUB_OUTPUT"
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set -o pipefail
+          terraform plan -no-color -lock-timeout=120s \
+            -var "image_tag=${{ steps.image.outputs.tag }}" \
+            -out=tfplan 2>&1 | tee plan.txt
+
+      - name: comment plan on PR
+        if: always() && steps.plan.outcome != 'skipped'
+        uses: actions/github-script@v9
+        env:
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const root = process.env.TF_ROOT;
+            const marker = `<!-- terraform-plan:${root} -->`;
+            let plan = '';
+            try { plan = fs.readFileSync(`${root}/plan.txt`, 'utf8'); } catch (e) { plan = '(no plan output)'; }
+            const limit = 60000; // GitHub comment limit is 65536 chars
+            if (plan.length > limit) {
+              plan = plan.slice(0, limit) + `\n\n... truncated ${plan.length - limit} characters; see the workflow log.`;
+            }
+            const status = process.env.PLAN_OUTCOME === 'success' ? 'succeeded' : 'FAILED';
+            const body = [
+              marker,
+              `### Terraform plan for \`${root}\` ${status}`,
+              `Commit ${context.sha.slice(0, 7)} | [workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```hcl',
+              plan,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, per_page: 100,
+            });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body });
+            }
+
+  apply:
+    name: apply
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    # `environment` is not decoration: the apply role's trust policy (modules/github_oidc_roles) only
+    # accepts the OIDC subject `repo:<org>/<repo>:environment:<name>`, where <name> is the root's
+    # `github_environment` variable (default "prod"). TF_ENVIRONMENT here MUST equal that variable or
+    # AssumeRoleWithWebIdentity fails with "Not authorized to perform sts:AssumeRoleWithWebIdentity".
+    # The plan role, by contrast, trusts `pull_request` subjects and needs no environment.
+    #
+    # Required reviewers / wait timers on Environments are available on public repos and on
+    # GitHub Enterprise; on private repos under Free/Team plans the environment exists but cannot
+    # gate. Fallback for those plans: protect `main` (require PR + review, no direct pushes) so the
+    # only way to reach this job is a reviewed merge, and keep `workflow_dispatch` for manual applies.
+    environment: ${{ vars.TF_ENVIRONMENT || 'prod' }}
+    # One apply at a time per root. The S3 lockfile would also stop a second
+    # apply, but queueing here is friendlier than a failed job.
+    concurrency:
+      group: terraform-apply-${{ vars.TF_ROOT }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: ${{ vars.TF_ROOT }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.TF_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-apply-${{ github.run_id }}
+
+      - name: terraform init
+        run: terraform init -lockfile=readonly
+
+      - name: resolve deployed image tag
+        id: image
+        run: |
+          tag="$(terraform output -raw image_tag 2>/dev/null || true)"
+          echo "tag=${tag:-bootstrap}" >> "$GITHUB_OUTPUT"
+
+      - name: terraform plan
+        run: |
+          terraform plan -no-color -lock-timeout=300s \
+            -var "image_tag=${{ steps.image.outputs.tag }}" \
+            -out=tfplan
+
+      # Applies exactly the plan computed above from this commit.
+      - name: terraform apply
+        run: terraform apply -no-color -lock-timeout=300s tfplan

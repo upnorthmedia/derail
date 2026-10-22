@@ -1,0 +1,109 @@
+# syntax=docker/dockerfile:1.7
+# Next.js 15/16 (App Router) with `output: 'standalone'`, built for ECS Fargate (linux/arm64 by default).
+#
+# Two images come out of this file, from the same build graph (the `builder` layers are shared):
+#   runner (default, final stage) - minimal standalone server, what the ECS web service runs
+#   tools                          - full node_modules + source, what migrations need
+#
+# Build (both targets; the GitHub workflow in assets/github-workflows/deploy.yml does exactly this):
+#   docker buildx build --platform linux/arm64 --target runner -t <ecr>/<repo>:<sha> \
+#     --build-arg NEXT_PUBLIC_SERVER_URL=https://app.example.com --build-arg GIT_SHA=<sha> \
+#     --secret id=DATABASE_URL,env=DATABASE_URL .       # secret only if `next build` needs the DB (Payload does)
+#   docker buildx build --platform linux/arm64 --target tools  -t <ecr>/<repo>:<sha>-tools .
+#
+# Why a separate tools image: the standalone output contains only the files the server traces, so
+# `payload migrate`, `drizzle-kit migrate`, `prisma migrate deploy` and `npx auth@latest migrate`
+# cannot run from the runner image (no CLI, no migration sources, no dev deps). The tools image is
+# what Railway's `preDeployCommand` ran against: same code, same env, run once before the rollout.
+#
+# Why these choices:
+# - Debian slim (not Alpine): sharp and other native deps ship glibc arm64 binaries; Alpine needs libc6-compat.
+# - NEXT_PUBLIC_* are inlined at build time, so they MUST be build args, not runtime env (a classic Vercel->Docker trap).
+# - Non-root `node` user, tini as PID 1 so SIGTERM reaches the server and `after()` callbacks can drain.
+# - HOSTNAME=0.0.0.0 or the standalone server binds to localhost and the ALB health check fails.
+# - The RDS CA bundle is baked in so DATABASE_URL can use sslmode=verify-full (pg: ssl.ca = readFileSync(RDS_CA_BUNDLE_PATH)).
+#   Never ship rejectUnauthorized:false / sslmode=no-verify to RDS.
+#
+# pnpm: `corepack enable pnpm` picks the version pinned in package.json#packageManager, then
+# `pnpm install --frozen-lockfile` refuses to proceed if the lockfile does not match package.json.
+# A stub or outdated pnpm-lock.yaml (common after dependency swaps such as db-vercel-postgres ->
+# db-postgres) must be regenerated locally first: `pnpm install` (no --frozen-lockfile) and commit
+# the new lockfile. The same applies to `npm ci` / `yarn install --frozen-lockfile`.
+
+ARG NODE_VERSION=24-bookworm-slim
+# Amazon RDS global CA bundle (all regions, all RDS CA generations). Pinned URL, public file.
+ARG RDS_CA_BUNDLE_URL=https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+
+# ---------- deps: install exactly what the lockfile says ----------
+FROM node:${NODE_VERSION} AS deps
+WORKDIR /app
+COPY package.json pnpm-lock.yaml* package-lock.json* yarn.lock* .npmrc* ./
+RUN --mount=type=cache,target=/root/.npm \
+    --mount=type=cache,target=/root/.local/share/pnpm/store \
+    if [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm install --frozen-lockfile; \
+    elif [ -f package-lock.json ]; then npm ci --no-audit --no-fund; \
+    elif [ -f yarn.lock ]; then corepack enable yarn && yarn install --frozen-lockfile; \
+    else echo "No lockfile found. Commit one (pnpm-lock.yaml, package-lock.json or yarn.lock)." && exit 1; fi
+
+# ---------- builder: next build ----------
+FROM node:${NODE_VERSION} AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1
+
+# Build-time inputs. Add one ARG+ENV pair per NEXT_PUBLIC_* variable your app uses.
+ARG NEXT_PUBLIC_SERVER_URL
+ARG GIT_SHA=dev
+ENV NEXT_PUBLIC_SERVER_URL=$NEXT_PUBLIC_SERVER_URL GIT_SHA=$GIT_SHA
+
+# Payload CMS and some ORMs touch the database during `next build`. Pass it as a BuildKit secret so it never
+# lands in an image layer. Harmless if the secret is not provided.
+RUN --mount=type=secret,id=DATABASE_URL,env=DATABASE_URL \
+    NODE_OPTIONS=--max-old-space-size=4096 \
+    sh -c 'if [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm build; \
+           elif [ -f yarn.lock ]; then corepack enable yarn && yarn build; \
+           else npm run build; fi'
+
+# ---------- tools: migrations and one-off commands (NOT the final stage) ----------
+# Full node_modules (dev deps included: drizzle-kit, prisma CLI, payload CLI, tsx) + the whole source
+# tree + the build output, so any `package.json` script runs here exactly as it would in CI.
+# Used by the deploy workflow as a one-off ECS task before `terraform apply` (Railway preDeployCommand).
+FROM node:${NODE_VERSION} AS tools
+ARG RDS_CA_BUNDLE_URL
+WORKDIR /app
+ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 RDS_CA_BUNDLE_PATH=/app/global-bundle.pem
+RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && corepack enable
+COPY --from=builder --chown=node:node /app ./
+ADD --chown=node:node ${RDS_CA_BUNDLE_URL} /app/global-bundle.pem
+USER node
+ENTRYPOINT ["/usr/bin/tini", "--"]
+# Override per project. Payload: ["npx","payload","migrate"]  Drizzle: ["npx","drizzle-kit","migrate"]
+# Prisma: ["npx","prisma","migrate","deploy"]  Better Auth: ["npx","auth@latest","migrate"] (wrap: ["sh","-c","..."])
+# The Terraform migration task definition can also override `command`; this CMD is the fallback.
+CMD ["npm", "run", "db:migrate"]
+
+# ---------- runner: minimal standalone server (final/default stage) ----------
+FROM node:${NODE_VERSION} AS runner
+ARG RDS_CA_BUNDLE_URL
+WORKDIR /app
+ENV NODE_ENV=production PORT=3000 HOSTNAME=0.0.0.0 NEXT_TELEMETRY_DISABLED=1 RDS_CA_BUNDLE_PATH=/app/global-bundle.pem
+# sharp on glibc: keep the allocator from fragmenting under image optimization load.
+ENV MALLOC_ARENA_MAX=2
+RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates wget \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p .next && chown node:node .next
+
+COPY --from=builder --chown=node:node /app/public ./public
+COPY --from=builder --chown=node:node /app/.next/standalone ./
+COPY --from=builder --chown=node:node /app/.next/static ./.next/static
+ADD --chown=node:node ${RDS_CA_BUNDLE_URL} /app/global-bundle.pem
+
+USER node
+EXPOSE 3000
+# The ECS task definition also defines a health check; this one helps local `docker run` testing.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s CMD wget -qO- http://127.0.0.1:3000/api/health || exit 1
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "server.js"]

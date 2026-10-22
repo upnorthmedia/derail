@@ -1,0 +1,32 @@
+# Copy to terraform.tfvars and edit. Nothing in here is secret.
+
+repository  = "github.com/acme/infra"
+aws_region  = "us-east-1"
+alert_email = "ops@example-agency.com"
+
+# Must match the network root (VPC tag) and every project root's platform_name.
+# platform_name = "platform"
+# environment   = "prod"
+
+# Shared ALB (~$25/month however many projects use it) -------------------------
+create_shared_alb         = true
+platform_domain_name      = "apps.example-agency.com" # the listener's default certificate; answers 404
+platform_hosted_zone_name = "example-agency.com"      # existing, delegated public zone
+# alb_idle_timeout        = 60                         # largest value any tenant needs
+
+# Shared RDS (~$26/month for db.t4g.small + 20 GiB) ----------------------------
+create_shared_database = true
+db_instance_class      = "db.t4g.small" # max_connections ~190; db.t4g.medium (~$47) when memory-bound
+db_engine_version      = "18"           # every tenant shares this major
+db_allocated_storage   = 20
+# db_max_allocated_storage      = 200
+db_multi_az = false # true doubles the instance price, failover for every tenant in 1-2 min
+# db_backup_retention_period    = 7
+# db_connection_alarm_threshold = 130    # ~0.7 x max_connections
+
+deletion_protection = true # protects every tenant; false only to decommission the platform
+
+# container_insights = "disabled"
+
+# Budget for everything tagged Project = platform_name (this root + network/ + bootstrap/)
+monthly_budget_usd = 100

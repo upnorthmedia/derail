@@ -1,0 +1,83 @@
+# syntax=docker/dockerfile:1.7
+# Generic Node.js service (Express, Fastify, Hono, NestJS, workers) for ECS Fargate.
+# Replaces Railway's Railpack/Nixpacks auto-build. Edit the three marked lines to match package.json scripts.
+#
+# Two images from one file:
+#   runner (default, final stage) - built app + production deps only
+#   tools                          - built app + ALL deps (dev included), for migrations / one-off scripts
+#
+# Build:
+#   docker buildx build --platform linux/arm64 --target runner -t <ecr>/<repo>:<sha> .
+#   docker buildx build --platform linux/arm64 --target tools  -t <ecr>/<repo>:<sha>-tools .
+#
+# Why a tools image: `prisma migrate deploy`, `drizzle-kit migrate`, `knex migrate:latest`, `typeorm
+# migration:run` and most seed scripts need dev dependencies and the un-bundled source, which the pruned
+# runner does not carry. The deploy workflow runs the tools image as a one-off ECS task BEFORE the
+# rollout, mirroring Railway's preDeployCommand.
+#
+# The RDS CA bundle is baked into both images so DATABASE_URL can use sslmode=verify-full
+# (pg: ssl: { ca: fs.readFileSync(process.env.RDS_CA_BUNDLE_PATH) }). Never ship rejectUnauthorized:false to RDS.
+#
+# Lockfiles: `pnpm install --frozen-lockfile` / `npm ci` fail when the lockfile is stale or a stub. Regenerate
+# locally (`pnpm install`, `npm install`) and commit before building.
+
+ARG NODE_VERSION=24-bookworm-slim
+ARG RDS_CA_BUNDLE_URL=https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+
+FROM node:${NODE_VERSION} AS deps
+WORKDIR /app
+COPY package.json pnpm-lock.yaml* package-lock.json* yarn.lock* .npmrc* ./
+RUN --mount=type=cache,target=/root/.npm \
+    --mount=type=cache,target=/root/.local/share/pnpm/store \
+    if [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm install --frozen-lockfile; \
+    elif [ -f package-lock.json ]; then npm ci --no-audit --no-fund; \
+    elif [ -f yarn.lock ]; then corepack enable yarn && yarn install --frozen-lockfile; \
+    else echo "No lockfile found" && exit 1; fi
+
+# ---------- builder: compile with dev deps present ----------
+FROM node:${NODE_VERSION} AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+ENV NODE_ENV=production
+# (1) Build step: matches Railway's "build command". Remove if the app has no build.
+#     Prisma: run `npx prisma generate` before the build (add it to the build script or uncomment below).
+# RUN npx prisma generate
+RUN sh -c 'if [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm run build; else npm run build; fi'
+
+# ---------- tools: full deps + source + build output (NOT the final stage) ----------
+FROM node:${NODE_VERSION} AS tools
+ARG RDS_CA_BUNDLE_URL
+WORKDIR /app
+ENV NODE_ENV=production RDS_CA_BUNDLE_PATH=/app/global-bundle.pem
+# openssl: Prisma's query engine needs it on Debian slim images; harmless for everything else.
+RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates openssl \
+ && rm -rf /var/lib/apt/lists/* \
+ && corepack enable
+COPY --from=builder --chown=node:node /app ./
+ADD --chown=node:node ${RDS_CA_BUNDLE_URL} /app/global-bundle.pem
+USER node
+ENTRYPOINT ["/usr/bin/tini", "--"]
+# Override per project (or via the Terraform migration task definition `command`):
+# Prisma: ["npx","prisma","migrate","deploy"]  Drizzle: ["npx","drizzle-kit","migrate"]  Knex: ["npx","knex","migrate:latest"]
+CMD ["npm", "run", "db:migrate"]
+
+# ---------- prod-deps: prune dev dependencies for the runtime image ----------
+FROM builder AS prod-deps
+# (2) Prune dev dependencies so the runtime image stays small.
+RUN sh -c 'if [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm prune --prod; else npm prune --omit=dev; fi'
+
+# ---------- runner: final/default stage ----------
+FROM node:${NODE_VERSION} AS runner
+ARG RDS_CA_BUNDLE_URL
+WORKDIR /app
+ENV NODE_ENV=production PORT=3000 RDS_CA_BUNDLE_PATH=/app/global-bundle.pem
+RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates wget openssl \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=prod-deps --chown=node:node /app ./
+ADD --chown=node:node ${RDS_CA_BUNDLE_URL} /app/global-bundle.pem
+USER node
+EXPOSE 3000
+ENTRYPOINT ["/usr/bin/tini", "--"]
+# (3) Start command: matches Railway's "start command" / Procfile web process.
+CMD ["node", "dist/index.js"]

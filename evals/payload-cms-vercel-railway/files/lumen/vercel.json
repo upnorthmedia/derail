@@ -1,0 +1,2 @@
+{ "headers": [{ "source": "/(.*)", "headers": [{ "key": "X-Frame-Options", "value": "SAMEORIGIN" }] }],
+  "redirects": [{ "source": "/lasik-self-test", "destination": "/self-test/lasik", "permanent": true }] }

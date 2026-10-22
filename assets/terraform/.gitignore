@@ -1,0 +1,35 @@
+# Terraform / OpenTofu
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+tfplan
+plan.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Variable files: ignored by default so a stray secret never lands in git.
+# Each root's terraform.tfvars is the exception: it holds only non-secret
+# settings by design (secrets live in Secrets Manager) and CI needs it.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+!bootstrap/terraform.tfvars
+!network/terraform.tfvars
+!platform/terraform.tfvars
+!live/*/*/terraform.tfvars
+
+# Keep the dependency lock files: CI runs `init -lockfile=readonly`.
+!.terraform.lock.hcl
+
+# Tooling
+.infracost/
+.tflint.d/
+.trivy/
+.DS_Store

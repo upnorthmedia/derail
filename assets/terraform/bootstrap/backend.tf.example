@@ -1,0 +1,28 @@
+# Copy this file to backend.tf AFTER the first successful `terraform apply`
+# of the bootstrap root (the bucket must exist before Terraform can store
+# state in it). Then run:
+#
+#   terraform init -migrate-state
+#
+# answer "yes", confirm `terraform state list` still shows your resources,
+# and delete the local terraform.tfstate / terraform.tfstate.backup files.
+#
+# Values cannot be variables here (Terraform does not allow interpolation in
+# backend blocks), so fill them in by hand from the bootstrap outputs:
+#   terraform output -raw state_bucket
+#   terraform output -raw aws_region
+
+terraform {
+  backend "s3" {
+    bucket = "tfstate-123456789012-us-east-1" # <- terraform output -raw state_bucket
+    key    = "bootstrap/terraform.tfstate"    # keep this key; CI roles are denied access to bootstrap/*
+    region = "us-east-1"                      # <- terraform output -raw aws_region
+
+    # Native S3 locking (Terraform >= 1.10 / OpenTofu >= 1.10). No DynamoDB table needed.
+    use_lockfile = true
+    encrypt      = true
+
+    # Only if you set state_kms_key_arn:
+    # kms_key_id = "arn:aws:kms:us-east-1:123456789012:key/..."
+  }
+}

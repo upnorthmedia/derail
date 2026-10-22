@@ -1,0 +1,140 @@
+# Copy to terraform.tfvars (git-ignored) and fill in. No secrets belong here:
+# app secrets go to Secrets Manager via scripts/put_secrets.sh.
+
+project     = "example-app"
+environment = "prod"
+aws_region  = "us-east-1"
+
+repository  = "github.com/acme/example-app"
+github_org  = "acme"
+github_repo = "example-app"
+# Must equal the apply job's `environment:` in .github/workflows/terraform.yml.
+# null only if that job has no environment key.
+github_environment = "prod"
+# github_repository_ids = { owner_id = 123456, repo_id = 7891011 } # only for immutable OIDC subjects
+
+platform_name = "platform" # must match the network (and platform) root
+
+# Agency / shared platform (optional) ----------------------------------------
+# Requires the platform/ root to be applied. Each flag swaps a per-project
+# resource for the shared one; defaults (false) keep everything dedicated.
+#   shared_alb       saves the ~$25/month ALB; this project attaches its own
+#                    certificate (SNI) + host rules at listener_rule_priority
+#                    and listener_rule_priority + 1 (MUST be unique per project;
+#                    table in platform/README.md).
+#   shared_database  saves the ~$12-23/month instance; the project's database
+#                    (shared_db_name, default <project> with _ for -) and roles
+#                    are created with scripts/pg_migrate.sh roles; db_* sizing
+#                    variables below are ignored.
+#   shared_cluster   free either way; just less console noise.
+# With cpu = 256 / memory = 512 / FARGATE_SPOT the web task costs ~$2-3/month
+# (0.25 vCPU / 0.5 GiB Spot vs $7.21 on-demand) + $3.65 public IPv4. Spot
+# tasks can be reclaimed with 2 minutes notice; with min_capacity = 1 that is
+# a short outage, so keep FARGATE for anything that cannot blink.
+# shared_cluster         = true
+# shared_alb             = true
+# shared_database        = true
+# shared_db_name         = null   # null = "example_app"
+# listener_rule_priority = 120
+# cpu                    = 256
+# memory                 = 512
+# capacity_provider      = "FARGATE_SPOT"
+
+# DNS ----------------------------------------------------------------------
+domain_name             = "app.example.com"
+hosted_zone_name        = "example.com"
+additional_domain_names = [] # e.g. ["www.example.com"]: cert SAN + 301 to domain_name
+create_hosted_zone      = false # true: this root creates the zone; set the output name servers at the registrar
+
+# Cutover switch. "old" = public hostnames keep pointing at the old platform
+# (old_platform_records), "aws" = alias records to CloudFront / the ALB.
+traffic_target = "old"
+old_platform_records = {
+  # "app.example.com" = { type = "A", records = ["76.76.21.21"] }                     # Vercel apex
+  # "www.example.com" = { type = "CNAME", records = ["cname.vercel-dns.com"] }       # Vercel www
+  # "app.example.com" = { type = "CNAME", records = ["xyz.up.railway.app"] }         # Railway (sub-domain only; no CNAME at an apex)
+}
+# Everything else at the old DNS provider; copy BEFORE moving the NS records.
+extra_dns_records = {
+  # "example.com"        = { type = "MX",  records = ["1 smtp.google.com."], ttl = 3600 }
+  # "example.com-spf"    = { name = "example.com", type = "TXT", records = ["v=spf1 include:_spf.google.com ~all"] }
+  # "_dmarc.example.com" = { type = "TXT", records = ["v=DMARC1; p=quarantine"] }
+}
+
+alert_email        = "ops@example.com"
+monthly_budget_usd = 100
+
+# Container ----------------------------------------------------------------
+framework         = "nextjs" # nextjs | node | python | other (shapes the baseline env)
+image_tag         = "bootstrap" # CI overrides with -var image_tag=<git sha>
+container_port    = 3000
+health_check_path = "/api/health"
+cpu               = 512
+memory            = 1024
+desired_count     = 1
+min_capacity      = 1
+max_capacity      = 4
+capacity_provider = "FARGATE" # FARGATE_SPOT for dev/staging
+
+task_in_public_subnets = true # false needs the NAT gateway in the network root (~$33/month)
+container_insights     = "disabled"
+enable_execute_command = false
+log_retention_days     = 30
+
+# Database (ignored when shared_database = true) ---------------------------
+db_instance_class    = "db.t4g.micro"
+db_engine_version    = "18" # must equal the source database's major
+db_allocated_storage = 20
+db_multi_az          = false
+deletion_protection  = true
+
+# Cache / queue broker (optional) ------------------------------------------
+enable_cache           = false
+cache_node_type        = "cache.t4g.micro"
+cache_maxmemory_policy = "noeviction" # allkeys-lru for a pure cache
+
+# App configuration. Names only; values via scripts/put_secrets.sh.
+secret_keys = ["DATABASE_URL", "SESSION_SECRET"]
+plain_env = {
+  LOG_LEVEL = "info"
+}
+
+# Worker (optional) --------------------------------------------------------
+enable_worker  = false
+worker_command = [] # required when enable_worker, e.g. ["node", "dist/worker.js"]
+# worker_cpu               = null # null = same as web
+# worker_memory            = null
+# worker_capacity_provider = null # "FARGATE_SPOT" for idempotent consumers
+worker_desired_count = 1
+worker_min_capacity  = 1
+worker_max_capacity  = 2
+
+# Cron (optional). Created PAUSED until crons_enabled = true (flip at cutover).
+cron_jobs = {
+  # nightly-cleanup = { schedule = "cron(0 5 * * ? *)", command = ["node", "scripts/cleanup.js"] }
+}
+crons_enabled          = false
+cron_capacity_provider = "FARGATE_SPOT"
+
+# Migrations ---------------------------------------------------------------
+enable_migration_task  = true
+tools_image_tag_suffix = "-tools"
+migration_command      = ["npm", "run", "db:migrate"] # e.g. ["npx", "prisma", "migrate", "deploy"], ["alembic", "upgrade", "head"]
+
+# Temporary migration host (rehearsal + cutover window only; ~$5/month while on)
+enable_migration_host = false
+# migration_host_pg_major           = null # null = major of db_engine_version
+# migration_host_instance_type      = "t4g.nano"
+# migration_host_staging_bucket_arn = null
+
+# Media and edge (optional) ------------------------------------------------
+enable_media_bucket = false
+media_cdn           = true # false = private bucket, presigned URLs, no MEDIA_URL
+media_domain_name   = null # e.g. "cdn.example.com"
+enable_cloudfront   = false
+enable_waf          = false
+waf_path_rate_limits = [
+  # { path_prefix = "/api/auth/", limit = 300 }
+]
+cloudfront_origin_request_policy_name = "Managed-AllViewer" # ...AndCloudFrontHeaders-2022-06 for CloudFront-Viewer-Country
+create_image_cache_policy             = true                # false for non-Next.js apps / flat-rate plans

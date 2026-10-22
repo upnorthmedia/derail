@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1.7
+# Python web service / worker (FastAPI, Django, Flask, Celery) for ECS Fargate.
+# Uses uv when uv.lock exists, otherwise pip + requirements.txt. Edit the CMD to match Railway's start command.
+#
+# Build: docker buildx build --platform linux/arm64 -t <ecr>/<repo>:<sha> .
+#
+# Migrations: there is NO separate tools image for Python. The runtime image already contains the full
+# virtualenv and the source tree, so Alembic / Django migrations run with the SAME image and a different
+# command. In the deploy workflow set BUILD_TOOLS_IMAGE=false and point the migration task at
+# <repo>:<sha> with MIGRATION_COMMAND="alembic upgrade head" (Django: "python manage.py migrate --noinput").
+# That one-off task runs BEFORE `terraform apply` rolls the service, mirroring Railway's preDeployCommand.
+#
+# The RDS CA bundle is baked in so DATABASE_URL can use sslmode=verify-full&sslrootcert=$RDS_CA_BUNDLE_PATH
+# (psycopg/asyncpg honour sslrootcert; SQLAlchemy passes it through connect_args). Never ship sslmode=disable
+# or sslmode=no-verify to RDS.
+
+ARG PYTHON_VERSION=3.12-slim-bookworm
+ARG RDS_CA_BUNDLE_URL=https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+
+FROM python:${PYTHON_VERSION} AS builder
+WORKDIR /app
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 UV_PROJECT_ENVIRONMENT=/opt/venv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY pyproject.toml* uv.lock* requirements*.txt ./
+RUN --mount=type=cache,target=/root/.cache \
+    if [ -f uv.lock ]; then uv sync --frozen --no-dev; \
+    else python -m venv /opt/venv && /opt/venv/bin/pip install -r requirements.txt; fi
+COPY . .
+
+FROM python:${PYTHON_VERSION} AS runner
+ARG RDS_CA_BUNDLE_URL
+WORKDIR /app
+ENV PATH=/opt/venv/bin:$PATH PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PORT=8000 \
+    RDS_CA_BUNDLE_PATH=/app/global-bundle.pem
+RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates wget \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --create-home --uid 10001 app
+COPY --from=builder --chown=app:app /opt/venv /opt/venv
+COPY --from=builder --chown=app:app /app /app
+ADD --chown=app:app ${RDS_CA_BUNDLE_URL} /app/global-bundle.pem
+USER app
+EXPOSE 8000
+ENTRYPOINT ["/usr/bin/tini", "--"]
+# Web:    uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
+# Django: gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2
+# Worker: celery -A app.celery worker --loglevel=info   (set container_command / worker_command in Terraform instead of editing this)
+# Migrate: alembic upgrade head                          (MIGRATION_COMMAND in the deploy workflow / migration task definition)
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
