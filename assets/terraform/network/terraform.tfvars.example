@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars and edit. Nothing in here is secret.
+
+repository = "github.com/acme/infra"
+aws_region = "us-east-1"
+
+# Defaults shown; uncomment to change.
+# platform_name      = "platform"
+# vpc_cidr           = "10.0.0.0/16"
+# enable_nat_gateway = false   # ~$33/month + $0.045/GB when true
+# stable_nat_eip     = false   # with NAT: own the egress EIP (prevent_destroy) for third-party allow-lists
+# enable_flow_logs   = false

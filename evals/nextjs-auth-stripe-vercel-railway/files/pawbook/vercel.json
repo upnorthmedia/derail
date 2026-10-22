@@ -1,0 +1,2 @@
+{ "crons": [{ "path": "/api/cron/reminders", "schedule": "0 14 * * *" }, { "path": "/api/cron/cleanup", "schedule": "0 4 * * 0" }],
+  "functions": { "src/app/api/**": { "maxDuration": 30 } } }

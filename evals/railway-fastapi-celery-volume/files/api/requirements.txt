@@ -1,0 +1,10 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+alembic==1.14.0
+psycopg[binary,pool]==3.2.3
+redis==5.2.1
+celery==5.4.0
+boto3==1.35.90
+pydantic-settings==2.7.0
+python-multipart==0.0.20

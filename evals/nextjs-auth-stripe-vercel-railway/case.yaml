@@ -1,0 +1,13 @@
+schema_version: "1.1"
+name: nextjs-auth-stripe-vercel-railway
+expected_outcome: |
+  A migration package at "standard" tier for a customer-facing Next.js app: ECS Fargate + RDS
+  PostgreSQL 18 with PostGIS confirmed available, CloudFront + WAF, Better Auth and Twilio/Stripe
+  webhook handling behind a proxy addressed (BETTER_AUTH_URL, forwarded headers, Twilio URL
+  construction, dual-registered Stripe endpoint), the edge-runtime cron route converted and the two
+  Vercel crons mapped to EventBridge Scheduler, a DNS plan that deals with Vercel DNS (move the zone
+  to Route 53 early or change records only), a 15-minute dump/restore cutover with verification,
+  validated Terraform, an honest cost comparison against the ~$12/month Railway + Vercel spend, and a
+  secret plan that re-sources every Secret-type variable and keeps BETTER_AUTH_SECRET through cutover.
+context:
+  scaffold_script: place-files.sh

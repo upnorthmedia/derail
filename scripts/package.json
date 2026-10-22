@@ -1,0 +1,24 @@
+{
+  "name": "railway-to-aws-scripts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node helpers for the railway-to-aws skill (Vercel Blob -> S3 copy). Install with: npm install (in this directory).",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "blob:dry-run": "tsx blob_to_s3.ts --dry-run",
+    "blob:copy": "tsx blob_to_s3.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.700.0",
+    "@aws-sdk/lib-storage": "^3.700.0",
+    "@vercel/blob": "^2.8.0",
+    "p-limit": "^6.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

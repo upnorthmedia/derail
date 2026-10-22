@@ -1,0 +1,27 @@
+# Terraform working files (the asset tree ships none)
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+
+# Node
+node_modules/
+scripts/node_modules/
+
+# Python
+__pycache__/
+*.pyc
+
+# Eval runs and packaging
+evals/results/
+*.skill
+*-workspace/
+
+# Secrets never belong here; the scripts write them to migration/.secrets which is git-ignored in user repos
+migration/.secrets/
+.env
+.env.*
+!.env.example

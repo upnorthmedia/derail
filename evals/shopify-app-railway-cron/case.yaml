@@ -1,0 +1,14 @@
+schema_version: "1.1"
+name: shopify-app-railway-cron
+expected_outcome: |
+  A migration package for a Shopify embedded app on Railway (React Router + Prisma + Postgres 18, nightly
+  cron, no custom domain): shared-tier recommendation (shared ALB/cluster/DB) with the per-project cost
+  next to Railway's ~$7/month, a Node Dockerfile replacing Railpack with prisma generate at build, the
+  cron mapped to EventBridge Scheduler at cron(47 0 * * ? *) created disabled until cutover, Prisma
+  migrate deploy as the one-off migration task from the tools image, a custom domain plan (the app URL
+  and OAuth redirect URLs in shopify.app.toml and the Partner dashboard must change via `shopify app
+  deploy` at cutover; webhook HMAC headers forwarded through CloudFront; embedded iframe/CSP headers
+  untouched), same-major pg_dump/pg_restore with verification, validated Terraform, secrets plan that
+  re-sources the Shopify and Partner API secrets, and a runbook. No secret values, nothing applied.
+context:
+  scaffold_script: place-files.sh

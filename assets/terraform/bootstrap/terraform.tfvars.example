@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored; this
+# file is not. Nothing in here is secret.
+
+aws_region         = "us-east-1"
+repository         = "github.com/acme/infra"
+alert_email        = "ops@example.com"
+monthly_budget_usd = 150
+
+# Optional knobs (defaults shown):
+# anomaly_threshold_usd         = 10
+# state_kms_key_arn             = null
+# enable_github_oidc            = true
+# activate_cost_allocation_tags = false   # flip to true ~24h after the first apply

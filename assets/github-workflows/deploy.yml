@@ -1,0 +1,407 @@
+# Build the container images, run migrations as a one-off ECS task, then roll the service out with Terraform.
+#
+# Order (mirrors Railway: build -> preDeployCommand -> start new deployment):
+#   outputs  read the current Terraform outputs (read-only role)
+#   build    buildx linux/arm64 -> ECR  :<sha> (target runner) and :<sha>-tools (target tools)
+#   migrate  copy the Terraform-managed migration task definition, point it at :<sha>-tools, RunTask,
+#            wait, check the exit code, print the log stream. A failure STOPS the workflow here: the
+#            running service is untouched (this is Railway's preDeployCommand semantics).
+#   apply    terraform apply -var image_tag=<sha> (rolling deploy, circuit breaker on) -> wait for the
+#            service to stabilise -> print the app URL.
+#
+# Required repository variables (Settings -> Secrets and variables -> Actions -> Variables):
+#   AWS_REGION             e.g. us-east-1
+#   AWS_DEPLOY_ROLE_ARN    Terraform output github_deploy_role_arn: ECR push, ECS Describe/RegisterTaskDefinition,
+#                          RunTask/DescribeTasks/StopTask, iam:PassRole on the task + execution roles,
+#                          logs:DescribeLogStreams/GetLogEvents on the migration log group
+#   AWS_APPLY_ROLE_ARN     Terraform output github_apply_role_arn (terraform apply)
+#   TF_ROOT                path of the Terraform root in this repo, e.g. infra/live/acme-app/prod
+# Optional repository variables:
+#   AWS_PLAN_ROLE_ARN      Terraform output github_plan_role_arn (read-only + state); used by the `outputs`
+#                          job. Falls back to AWS_APPLY_ROLE_ARN when unset.
+#   ECR_REPOSITORY         repository name (the part after "/" in ecr_repository_url). Default: taken from the
+#                          Terraform output ecr_repository_url.
+#   RUN_MIGRATIONS         "true" to run the migration task before every apply (default "false"; the
+#                          workflow_dispatch input overrides it for one run)
+#   MIGRATION_COMMAND      override the migration container command, e.g. "alembic upgrade head" or
+#                          "npx payload migrate". Default: the command baked into the task definition / image CMD.
+#   MIGRATION_TIMEOUT      seconds to wait for the migration task, default 900
+#   BUILD_TOOLS_IMAGE      "false" to skip the :<sha>-tools image (Python: the runtime image already contains
+#                          everything, migrations then run on :<sha>). Default: build it.
+#   DOCKER_BUILD_ARGS      newline-separated KEY=VALUE build args. NEXT_PUBLIC_* / VITE_* values are inlined
+#                          at build time and MUST be passed here, never as runtime task env.
+#   DOCKERFILE             default Dockerfile;   DOCKER_CONTEXT  default .
+#   TF_VERSION             default 1.17.0;       TF_ENVIRONMENT  GitHub Environment for the apply job, default "prod"
+#                          (must match the root's github_environment variable: it is part of the OIDC subject)
+#   BUILD_RUNNER           runner label for the build job, default ubuntu-latest (ubuntu-24.04-arm builds natively)
+# Optional repository secret:
+#   DOCKER_BUILD_SECRET_DATABASE_URL   BuildKit secret `DATABASE_URL` for builds that touch the DB (Payload).
+#                                      Mounted only during RUN --mount=type=secret; never in a layer or a log.
+#
+# Terraform outputs this workflow reads (the root in assets/terraform/live/<project>/<env> provides them):
+#   image_tag, ecr_repository_url, ecs_cluster_name, ecs_service_name, migration_task_family,
+#   migration_task_definition_arn, app_url and migration_run_task = { cluster, task_definition_family,
+#   subnets, security_groups, assign_public_ip, container_name, log_group }.
+#   Only these named outputs are read (`terraform output -raw/-json <name>`); the workflow never dumps
+#   `terraform output -json` as a whole, so a sensitive output can never reach the log.
+#
+# No long-lived AWS keys: every job authenticates with OpenID Connect. Nothing in this file prints a
+# secret: task definitions are never echoed (they carry secret ARNs and env), only names/ARNs/exit codes.
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      run_migrations:
+        description: "Run the migration task (tools image) before terraform apply"
+        type: boolean
+        default: false
+      image_tag:
+        description: "Redeploy an existing image tag instead of building (rollback). Leave empty to build HEAD."
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+# One deploy at a time per Terraform root; later pushes queue instead of racing the apply.
+concurrency:
+  group: deploy-${{ vars.TF_ROOT }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_ROOT: ${{ vars.TF_ROOT }}
+  TF_VERSION: ${{ vars.TF_VERSION || '1.17.0' }}
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
+  IMAGE_TAG: ${{ inputs.image_tag != '' && inputs.image_tag || github.sha }}
+  RUN_MIGRATIONS: ${{ (inputs.run_migrations == true || vars.RUN_MIGRATIONS == 'true') && 'true' || 'false' }}
+  BUILD_TOOLS_IMAGE: ${{ vars.BUILD_TOOLS_IMAGE != 'false' && 'true' || 'false' }}
+
+jobs:
+  # ------------------------------------------------------------------ 1. current Terraform outputs
+  outputs:
+    name: read terraform outputs
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ vars.TF_ROOT }}
+    outputs:
+      ecr_repository_url: ${{ steps.tf.outputs.ecr_repository_url }}
+      cluster: ${{ steps.tf.outputs.cluster }}
+      service: ${{ steps.tf.outputs.service }}
+      migration_task_family: ${{ steps.tf.outputs.migration_task_family }}
+      migration_run_task: ${{ steps.tf.outputs.migration_run_task }}
+      current_image_tag: ${{ steps.tf.outputs.current_image_tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN || vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-outputs-${{ github.run_id }}
+
+      # -lockfile=readonly: fail if .terraform.lock.hcl is stale instead of upgrading providers in CI.
+      - name: terraform init
+        run: terraform init -lockfile=readonly
+
+      - name: terraform output (named outputs only)
+        id: tf
+        run: |
+          set -euo pipefail
+          need() { # need <output-name> <github-output-key> [raw|json]
+            local v
+            if [ "${3:-raw}" = "json" ]; then v="$(terraform output -json "$1" 2>/dev/null | jq -c . || true)"
+            else v="$(terraform output -raw "$1" 2>/dev/null || true)"; fi
+            if [ -z "$v" ] || [ "$v" = "null" ]; then
+              echo "::error::Terraform output '$1' is missing in ${TF_ROOT}. Apply the root once (image_tag=bootstrap) and make sure outputs.tf exports it."; exit 1
+            fi
+            echo "$2=$v" >> "$GITHUB_OUTPUT"
+            echo "$1: $v"
+          }
+          need ecr_repository_url    ecr_repository_url
+          need ecs_cluster_name      cluster
+          need ecs_service_name      service
+          need migration_task_family migration_task_family
+          need migration_run_task    migration_run_task json
+          echo "current_image_tag=$(terraform output -raw image_tag 2>/dev/null || echo bootstrap)" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------ 2. build and push images
+  build:
+    name: build and push images
+    needs: [outputs]
+    # Skipped on a manual rollback that names an existing tag.
+    if: inputs.image_tag == ''
+    # Cross-building arm64 on x86 goes through QEMU and is 3-5x slower for RUN steps (npm install,
+    # next build). Use a native Arm runner when the plan allows it: BUILD_RUNNER=ubuntu-24.04-arm.
+    runs-on: ${{ vars.BUILD_RUNNER || 'ubuntu-latest' }}
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-build-${{ github.run_id }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: image metadata
+        id: meta
+        env:
+          ECR_URL_FROM_TF: ${{ needs.outputs.outputs.ecr_repository_url }}
+          ECR_REPOSITORY_VAR: ${{ vars.ECR_REPOSITORY }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          if [ -n "$ECR_REPOSITORY_VAR" ]; then image="${REGISTRY}/${ECR_REPOSITORY_VAR}"; else image="$ECR_URL_FROM_TF"; fi
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "runner image: ${image}:${IMAGE_TAG}"
+          [ "$BUILD_TOOLS_IMAGE" = "true" ] && echo "tools image:  ${image}:${IMAGE_TAG}-tools" || echo "tools image:  (skipped, BUILD_TOOLS_IMAGE=false)"
+
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Both targets share the deps/builder layers through the GitHub Actions cache (10 GB per repo,
+      # LRU). For very large images switch to type=registry,ref=<image>:buildcache,image-manifest=true,oci-mediatypes=true.
+      - name: build and push runner image (linux/arm64)
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ vars.DOCKER_CONTEXT || '.' }}
+          file: ${{ vars.DOCKERFILE || 'Dockerfile' }}
+          target: runner
+          platforms: linux/arm64
+          push: true
+          provenance: false # attestation manifests show up as untagged images in ECR
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ env.IMAGE_TAG }}
+            ${{ steps.meta.outputs.image }}:main
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            ${{ vars.DOCKER_BUILD_ARGS }}
+          # Empty when the repository secret is not set; the Dockerfile tolerates a missing secret.
+          secrets: |
+            DATABASE_URL=${{ secrets.DOCKER_BUILD_SECRET_DATABASE_URL }}
+          cache-from: type=gha,scope=${{ vars.TF_ROOT }}
+          cache-to: type=gha,mode=max,scope=${{ vars.TF_ROOT }}
+
+      - name: build and push tools image (linux/arm64)
+        if: env.BUILD_TOOLS_IMAGE == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ vars.DOCKER_CONTEXT || '.' }}
+          file: ${{ vars.DOCKERFILE || 'Dockerfile' }}
+          target: tools
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ env.IMAGE_TAG }}-tools
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            ${{ vars.DOCKER_BUILD_ARGS }}
+          secrets: |
+            DATABASE_URL=${{ secrets.DOCKER_BUILD_SECRET_DATABASE_URL }}
+          cache-from: type=gha,scope=${{ vars.TF_ROOT }}
+          cache-to: type=gha,mode=max,scope=${{ vars.TF_ROOT }}
+
+  # ------------------------------------------------------------------ 3. migrations (Railway preDeployCommand)
+  migrate:
+    name: run migrations
+    needs: [outputs, build]
+    # Runs after a successful build, or on a rollback (build skipped) when migrations were requested.
+    if: >-
+      always()
+      && needs.outputs.result == 'success'
+      && (needs.build.result == 'success' || (needs.build.result == 'skipped' && inputs.image_tag != ''))
+      && (inputs.run_migrations == true || vars.RUN_MIGRATIONS == 'true')
+    runs-on: ubuntu-latest
+    env:
+      ECR_REPOSITORY_URL: ${{ needs.outputs.outputs.ecr_repository_url }}
+      MIGRATION_TASK_FAMILY: ${{ needs.outputs.outputs.migration_task_family }}
+      MIGRATION_RUN_TASK: ${{ needs.outputs.outputs.migration_run_task }}
+      MIGRATION_COMMAND: ${{ vars.MIGRATION_COMMAND }}
+      MIGRATION_TIMEOUT: ${{ vars.MIGRATION_TIMEOUT || '900' }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-migrate-${{ github.run_id }}
+
+      # Take the Terraform-managed tools task definition (roles, secrets, log config, network all come
+      # from Terraform), swap only the image, register a new revision. Terraform keeps owning the family;
+      # the next apply simply registers its own revision on top. The JSON is never printed.
+      - name: register migration task definition revision
+        id: td
+        run: |
+          set -euo pipefail
+          if [ "$BUILD_TOOLS_IMAGE" = "true" ]; then image="${ECR_REPOSITORY_URL}:${IMAGE_TAG}-tools"; else image="${ECR_REPOSITORY_URL}:${IMAGE_TAG}"; fi
+          container="$(jq -r .container_name <<<"$MIGRATION_RUN_TASK")"
+          umask 077
+          aws ecs describe-task-definition --task-definition "$MIGRATION_TASK_FAMILY" --query taskDefinition --output json > td.current.json
+          jq --arg img "$image" --arg c "$container" '
+              del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+              | .containerDefinitions |= map(if .name == $c then .image = $img else . end)' td.current.json > td.new.json
+          if ! jq -e --arg c "$container" '.containerDefinitions[] | select(.name == $c)' td.new.json >/dev/null; then
+            echo "::error::container '${container}' not found in task definition family ${MIGRATION_TASK_FAMILY}"; exit 1
+          fi
+          arn="$(aws ecs register-task-definition --cli-input-json file://td.new.json --query taskDefinition.taskDefinitionArn --output text)"
+          rm -f td.current.json td.new.json
+          echo "task_definition_arn=${arn}" >> "$GITHUB_OUTPUT"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "registered ${arn##*/} with image ${image}"
+
+      - name: run migration task and wait
+        env:
+          TASK_DEFINITION_ARN: ${{ steps.td.outputs.task_definition_arn }}
+        run: |
+          set -euo pipefail
+          cluster="$(jq -r .cluster <<<"$MIGRATION_RUN_TASK")"
+          container="$(jq -r .container_name <<<"$MIGRATION_RUN_TASK")"
+          log_group="$(jq -r .log_group <<<"$MIGRATION_RUN_TASK")"
+          netcfg="$(jq -c '{awsvpcConfiguration: {subnets: .subnets, securityGroups: .security_groups, assignPublicIp: .assign_public_ip}}' <<<"$MIGRATION_RUN_TASK")"
+
+          run_args=(--cluster "$cluster" --task-definition "$TASK_DEFINITION_ARN" --launch-type FARGATE
+                    --network-configuration "$netcfg" --started-by "gha-migrate-${GITHUB_RUN_ID}"
+                    --propagate-tags TASK_DEFINITION --enable-ecs-managed-tags)
+          if [ -n "${MIGRATION_COMMAND:-}" ]; then
+            # "alembic upgrade head" -> ["alembic","upgrade","head"] (no shell; quote-free commands only)
+            overrides="$(jq -cn --arg n "$container" --arg c "$MIGRATION_COMMAND" '{containerOverrides: [{name: $n, command: ($c | split(" ") | map(select(length > 0)))}]}')"
+            run_args+=(--overrides "$overrides")
+            echo "command override: ${MIGRATION_COMMAND}"
+          else
+            echo "command: task definition / image default"
+          fi
+
+          echo "Running ${TASK_DEFINITION_ARN##*/} in ${cluster}"
+          task_arn="$(aws ecs run-task "${run_args[@]}" --query 'tasks[0].taskArn' --output text)"
+          if [ -z "$task_arn" ] || [ "$task_arn" = "None" ]; then
+            echo "::error::RunTask returned no task (capacity, subnet or iam:PassRole problem). Check 'failures' with: aws ecs run-task ... --query failures"; exit 1
+          fi
+          task_id="${task_arn##*/}"
+          echo "Task ${task_id} started; waiting up to ${MIGRATION_TIMEOUT}s"
+
+          # `aws ecs wait tasks-stopped` gives up after 100 x 6 s = 10 min; loop it for longer timeouts.
+          deadline=$(( $(date +%s) + MIGRATION_TIMEOUT ))
+          until aws ecs wait tasks-stopped --cluster "$cluster" --tasks "$task_arn" 2>/dev/null; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Migration task did not finish within ${MIGRATION_TIMEOUT}s; stopping it"
+              aws ecs stop-task --cluster "$cluster" --task "$task_arn" --reason "GitHub Actions timeout" >/dev/null || true
+              exit 1
+            fi
+          done
+
+          # Only the exit code and the stop reason are read from describe-tasks (never the overrides/env).
+          desc="$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task_arn" \
+                  --query "tasks[0].{code: containers[?name=='${container}'].exitCode | [0], reason: stoppedReason, stop: stopCode}" --output json)"
+          exit_code="$(jq -r '.code // "null"' <<<"$desc")"
+          stop_reason="$(jq -r '.reason // ""' <<<"$desc")"
+          echo "Container exit code: ${exit_code}; stop code: $(jq -r '.stop // ""' <<<"$desc"); reason: ${stop_reason}"
+
+          echo "::group::migration log (${log_group}, task ${task_id})"
+          stream="$(aws logs describe-log-streams --log-group-name "$log_group" \
+            --order-by LastEventTime --descending --max-items 50 \
+            --query "logStreams[?ends_with(logStreamName, '${task_id}')].logStreamName | [0]" --output text 2>/dev/null || true)"
+          if [ -n "$stream" ] && [ "$stream" != "None" ]; then
+            echo "log stream: ${stream}"
+            # Mask credentials in URLs in case the migration tool echoes its connection string.
+            aws logs get-log-events --log-group-name "$log_group" --log-stream-name "$stream" \
+              --start-from-head --limit 2000 --query 'events[].message' --output text \
+              | sed -E 's#(://[^:/@[:space:]]+):[^@[:space:]]*@#\1:***@#g' || true
+          else
+            echo "(no log stream found for task ${task_id}; the container may have failed before writing logs: ${stop_reason})"
+          fi
+          echo "::endgroup::"
+
+          if [ "$exit_code" != "0" ]; then
+            echo "::error::Migration failed (exit code ${exit_code}): ${stop_reason}. The service was NOT changed."
+            exit 1
+          fi
+          echo "Migration succeeded."
+
+  # ------------------------------------------------------------------ 4. terraform apply (rolling deploy)
+  apply:
+    name: terraform apply
+    needs: [outputs, build, migrate]
+    # Build ok (or skipped for a rollback) AND migrate ok (or skipped because migrations are off).
+    if: >-
+      always()
+      && needs.outputs.result == 'success'
+      && (needs.build.result == 'success' || (needs.build.result == 'skipped' && inputs.image_tag != ''))
+      && (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: ${{ vars.TF_ENVIRONMENT || 'prod' }}
+    env:
+      CLUSTER: ${{ needs.outputs.outputs.cluster }}
+      SERVICE: ${{ needs.outputs.outputs.service }}
+      PREVIOUS_IMAGE_TAG: ${{ needs.outputs.outputs.current_image_tag }}
+    defaults:
+      run:
+        working-directory: ${{ vars.TF_ROOT }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-apply-${{ github.run_id }}
+
+      - name: terraform init
+        run: terraform init -lockfile=readonly
+
+      # Terraform owns the image tag: the task definition revision, env vars and secrets all change
+      # through one plan, and rollback is re-running this workflow with the previous tag.
+      - name: terraform apply
+        run: |
+          echo "image_tag: ${PREVIOUS_IMAGE_TAG} -> ${IMAGE_TAG}"
+          terraform apply -auto-approve -no-color -lock-timeout=300s -var "image_tag=${IMAGE_TAG}"
+
+      # The ECS deployment circuit breaker rolls a bad image back on its own; this step surfaces it.
+      - name: wait for service to stabilise
+        run: |
+          echo "Waiting for ${SERVICE} on ${CLUSTER} to reach steady state with image ${IMAGE_TAG}"
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+          aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+            --query 'services[0].deployments[].{status:status,rollout:rolloutState,reason:rolloutStateReason,running:runningCount,desired:desiredCount}' \
+            --output table
+
+      - name: app url + summary
+        if: always()
+        run: |
+          app_url="$(terraform output -raw app_url 2>/dev/null || echo n/a)"
+          echo "App URL: ${app_url}"
+          {
+            echo "### Deploy ${IMAGE_TAG:0:7}"
+            echo "- root: \`${TF_ROOT}\`"
+            echo "- service: \`${SERVICE}\` on \`${CLUSTER}\`"
+            echo "- previous image tag: \`${PREVIOUS_IMAGE_TAG}\` (rollback: run this workflow with image_tag=that value)"
+            echo "- migrations: ${RUN_MIGRATIONS}"
+            echo "- app: ${app_url}"
+          } >> "$GITHUB_STEP_SUMMARY"

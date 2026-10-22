@@ -1,0 +1,13 @@
+schema_version: "1.1"
+name: payload-cms-vercel-railway
+expected_outcome: |
+  A complete migration package for a Next.js + Payload CMS site: an inventory that classifies every
+  variable and flags the Vercel-only pieces (db-vercel-postgres, storage-vercel-blob, Blob, analytics),
+  a plan that picks ECS Fargate + RDS PostgreSQL 18 (same major) + S3/CloudFront for media at a budget
+  tier with an itemized cost next to the current Railway/Vercel spend, Terraform copied and filled from
+  the skill assets that passes terraform validate, a Next.js standalone Dockerfile, the Payload adapter
+  swaps and health route, pg_dump/pg_restore steps with verification plus a Blob-to-S3 copy and URL
+  rewrite, a secret rotation plan that keeps PAYLOAD_SECRET identical through cutover, and a runbook.
+  No secret values appear anywhere and nothing is applied.
+context:
+  scaffold_script: place-files.sh

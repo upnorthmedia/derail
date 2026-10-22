@@ -1,0 +1,112 @@
+# CI for the skill repository itself: validates the Terraform assets, lints the scripts, and checks
+# that no file contains a secret-looking value. Runs on every push and pull request.
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: terraform validate + tflint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        root: [bootstrap, network, platform, live/example-app/prod]
+    defaults:
+      run:
+        working-directory: assets/terraform
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "~1.17.0"
+          terraform_wrapper: false
+      - name: fmt
+        run: terraform fmt -check -recursive
+      - name: init + validate (${{ matrix.root }})
+        working-directory: assets/terraform/${{ matrix.root }}
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+      - name: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          tflint --init
+          tflint --recursive --config "$(pwd)/.tflint.hcl"
+
+  opentofu:
+    name: opentofu validate (portability)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: assets/terraform/live/example-app/prod
+    steps:
+      - uses: actions/checkout@v7
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_wrapper: false
+      - run: tofu init -backend=false -input=false
+      - run: tofu validate
+
+  scripts:
+    name: shellcheck + python + fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning scripts/*.sh
+      - name: python compiles
+        run: python3 -m py_compile scripts/*.py
+      - name: scanner runs on every fixture
+        run: |
+          set -e
+          for d in evals/*/files/*/; do
+            case "$d" in *migration/) continue;; esac
+            python3 scripts/scan_codebase.py "$d" --json-only --out /tmp/scan.json
+          done
+      - name: cost estimator runs
+        run: |
+          python3 scripts/estimate_cost.py --tier budget --json > /dev/null
+          python3 scripts/estimate_cost.py --tier shared --spot-web --cron --json > /dev/null
+      - name: help texts
+        run: for s in scripts/*.sh; do bash "$s" --help > /dev/null; done
+
+  workflows:
+    name: actionlint (shipped workflow templates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) latest /usr/local/bin
+          actionlint assets/github-workflows/*.yml .github/workflows/*.yml
+
+  secrets-scan:
+    name: no secret-looking values
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: grep for credential patterns
+        run: |
+          set -e
+          # Real-looking keys, tokens and connection strings with embedded passwords must never be committed.
+          if grep -rnE '(sk_live_[A-Za-z0-9]{8,}|sk_test_[A-Za-z0-9]{8,}|AKIA[0-9A-Z]{16}|whsec_[A-Za-z0-9]{12,}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})' --exclude-dir=.git . ; then
+            echo "::error::credential-looking literal found"; exit 1; fi
+          if grep -rnE 'postgres(ql)?://[^:/@[:space:]]+:[^@[:space:]<$]{8,}@' --exclude-dir=.git . | grep -vE '(<|\$\{|\$[A-Z_]|\.\.\.|password|PASSWORD|pw|xxx|REDACTED|example)' ; then
+            echo "::error::connection string with an embedded password found"; exit 1; fi
+          echo "clean"

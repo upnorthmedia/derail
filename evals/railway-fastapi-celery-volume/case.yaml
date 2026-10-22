@@ -1,0 +1,13 @@
+schema_version: "1.1"
+name: railway-fastapi-celery-volume
+expected_outcome: |
+  A migration package for a non-Next.js, all-Railway stack: FastAPI web service and Celery worker on
+  ECS Fargate from one image, ElastiCache Valkey/Redis with TLS noted, RDS PostgreSQL 16 (same major,
+  pgvector confirmed), the nightly cron as an EventBridge Scheduler RunTask, the pre-deploy alembic
+  migration as a one-off task in CI, the /data volume replaced by S3 (with the worker reading from S3)
+  or EFS with the tradeoff stated, a NAT gateway with Elastic IPs for the bank allow-list, the sealed
+  BANK_API_KEY flagged for re-issue, a Python Dockerfile without the Railway cache-mount id, validated
+  Terraform in eu-central-1, a dump/restore plan for ~18 GB inside a 2-hour window, per-project
+  tagging/budgets, and a runbook. No secret values, nothing applied.
+context:
+  scaffold_script: place-files.sh
