@@ -41,7 +41,9 @@ surface every one of them *before* a single resource exists, and encodes the cho
 teams out of trouble: no secret values in Terraform state, same PostgreSQL major on both sides, nothing
 destructive on the source platform, per-project cost visibility inside a shared account.
 
-It was built by an agency moving its own client projects and is published so anyone can use it.
+Built and maintained by [Up North Media](https://github.com/upnorthmedia), an Omaha web development and
+AI consulting agency, while moving its own client projects off Railway and Vercel. Published under MIT so
+anyone can use it.
 
 ## What you get
 
@@ -59,7 +61,7 @@ It was built by an agency moving its own client projects and is published so any
 **Claude Code**
 
 ```bash
-git clone https://github.com/<your-org>/railway-to-aws ~/.claude/skills/railway-to-aws
+git clone https://github.com/upnorthmedia/railway-to-aws ~/.claude/skills/railway-to-aws
 ```
 
 **Claude.ai / Cowork**: upload `railway-to-aws.skill` from the latest release (or build one with
