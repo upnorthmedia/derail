@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.27@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # Next.js 15/16 (App Router) with `output: 'standalone'`, built for ECS Fargate (linux/arm64 by default).
 #
 # Two images come out of this file, from the same build graph (the `builder` layers are shared):
@@ -30,12 +30,18 @@
 # db-postgres) must be regenerated locally first: `pnpm install` (no --frozen-lockfile) and commit
 # the new lockfile. The same applies to `npm ci` / `yarn install --frozen-lockfile`.
 
-ARG NODE_VERSION=24-bookworm-slim
 # Amazon RDS global CA bundle (all regions, all RDS CA generations). Pinned URL, public file.
 ARG RDS_CA_BUNDLE_URL=https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 
+# Base images are pinned by digest (tag kept for readability), so a rebuild never silently picks up a
+# different image. Refresh: `docker buildx imagetools inspect <image:tag>` and copy the top-level
+# "Digest:" (the multi-arch index, which includes linux/arm64). To change the Node version, change the
+# tag AND the digest. Renovate and Dependabot (package-ecosystem: docker) both bump `FROM image:tag@sha256:...`
+# lines; Dependabot ignores ARG and COPY --from, hence one literal FROM per image. Renovate also bumps `# syntax=`.
+FROM node:24-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS base
+
 # ---------- deps: install exactly what the lockfile says ----------
-FROM node:${NODE_VERSION} AS deps
+FROM base AS deps
 WORKDIR /app
 COPY package.json pnpm-lock.yaml* package-lock.json* yarn.lock* .npmrc* ./
 RUN --mount=type=cache,target=/root/.npm \
@@ -46,7 +52,7 @@ RUN --mount=type=cache,target=/root/.npm \
     else echo "No lockfile found. Commit one (pnpm-lock.yaml, package-lock.json or yarn.lock)." && exit 1; fi
 
 # ---------- builder: next build ----------
-FROM node:${NODE_VERSION} AS builder
+FROM base AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -69,7 +75,7 @@ RUN --mount=type=secret,id=DATABASE_URL,env=DATABASE_URL \
 # Full node_modules (dev deps included: drizzle-kit, prisma CLI, payload CLI, tsx) + the whole source
 # tree + the build output, so any `package.json` script runs here exactly as it would in CI.
 # Used by the deploy workflow as a one-off ECS task before `terraform apply` (Railway preDeployCommand).
-FROM node:${NODE_VERSION} AS tools
+FROM base AS tools
 ARG RDS_CA_BUNDLE_URL
 WORKDIR /app
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 RDS_CA_BUNDLE_PATH=/app/global-bundle.pem
@@ -86,7 +92,7 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["npm", "run", "db:migrate"]
 
 # ---------- runner: minimal standalone server (final/default stage) ----------
-FROM node:${NODE_VERSION} AS runner
+FROM base AS runner
 ARG RDS_CA_BUNDLE_URL
 WORKDIR /app
 ENV NODE_ENV=production PORT=3000 HOSTNAME=0.0.0.0 NEXT_TELEMETRY_DISABLED=1 RDS_CA_BUNDLE_PATH=/app/global-bundle.pem
