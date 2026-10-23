@@ -32,7 +32,8 @@ vercel.com/docs, payloadcms.com. Scripts: `scripts/pg_migrate.sh`, `scripts/sql/
 ## 2. Dump and restore
 
 ```bash
-# Source: SSH tunnel (preferred; no public exposure, no egress billing)
+# Source: SSH tunnel (preferred; no public exposure, no egress billing). Needs Railway CLI >= 5.27.0
+# (4.x has no --tunnel-only; `railway --version`)
 railway connect postgres --tunnel-only            # prints local host/port/password; keep running
 export SRC_URL='postgresql://postgres:<pw>@localhost:<port>/railway'
 # Target: RDS master, from a machine that can reach the private subnet (SSM port-forward / CloudShell
@@ -40,6 +41,7 @@ export SRC_URL='postgresql://postgres:<pw>@localhost:<port>/railway'
 export TGT_URL='postgresql://postgres:<master-pw>@<endpoint>:5432/postgres?sslmode=verify-full&sslrootcert=global-bundle.pem'
 
 scripts/pg_migrate.sh preflight --pg-major-check   # versions (fails early if pg_dump < server major), size, extensions, tables without PK
+scripts/pg_migrate.sh audit                         # read-only (SRC_URL only): roles, SECURITY DEFINER functions, triggers, event triggers, rules, extensions, FDWs, live sessions -> migration/db/db-audit-<stamp>.md to sign off
 scripts/pg_migrate.sh dump                          # -Fd -j4 zstd --no-owner --no-privileges --no-subscriptions --no-publications
 #   PostGIS: add --exclude-table-data spatial_ref_sys (the extension recreates those rows on the target)
 scripts/pg_migrate.sh roles --target-db app         # creates app_owner / app_migrate / app_rw (passwords from env, never echoed)
@@ -53,6 +55,43 @@ CloudShell with VPC access, or an SSM port-forward from a laptop through that ho
 (`terraform output migration_host_port_forward_commands`). Dumping from Railway over the SSH tunnel
 works from wherever `railway` CLI runs; move the dump directory to the host with `aws s3 cp` to a
 private staging prefix and delete it afterwards.
+
+*(Breach mode only)* The Postgres password and `DATABASE_PUBLIC_URL` were exposed, and the TCP proxy
+makes them usable from anywhere on the internet. Before the first rehearsal dump: rotate the password
+(`references/breach-response.md` section 6), then delete the proxy so the database is reachable only
+through the tunnel above. First confirm nothing outside Railway still uses `DATABASE_PUBLIC_URL` (CI
+jobs, BI tools, local clients; check the inventory and `CODEBASE.md`). Then
+`railway tcp-proxy list --service <postgres>` and `railway tcp-proxy delete <id>` (CLI >= 5.15.0), or
+remove it in the dashboard under the service's Settings > Networking. `railway connect` tunnels over SSH
+when the service has no proxy. If a dump cannot use the tunnel, or you run logical replication (section
+3), re-create the proxy for that window only (`railway tcp-proxy create --port 5432 --service <postgres>`;
+read the new domain and port from `tcp-proxy list`) and delete it when the window closes.
+
+`restore` skips the dump's event triggers and foreign-server user mappings by default and names them in a
+NOTE: an event trigger needs superuser (it aborts the `--role app_owner` restore, and RDS needs it dropped
+before a major version upgrade) and a user mapping carries another server's credential; pass
+`--keep-event-triggers` (without `--role`) or `--keep-user-mappings` only for ones the db-audit report
+shows are yours.
+
+Foreign servers (`postgres_fdw` and other wrappers) are restored. With `--role`, `restore` grants that role
+USAGE on the target's foreign-data wrappers for the `pg_restore` only and revokes it afterwards (also when
+`pg_restore` fails), so the servers, foreign tables and views on them end up owned by the role. If the
+grant does not take effect, `restore` prints a WARN and `pg_restore` stops with
+`permission denied for foreign-data wrapper`; restore without `--role` instead (objects are then owned by
+the master user). The servers come back without their user mappings unless you pass
+`--keep-user-mappings`, so create a mapping with a new credential for each one the app still needs.
+
+Everything `pg_migrate.sh` writes under `--out` (default `migration/db`: dumps, reports, TOC lists,
+`restore-<stamp>.log`) is created mode 600, with new directories 700. The dump holds every row and any
+user-mapping password in plain text, and a failed restore's log repeats the failing statement, which can
+include that password. Every run except `--dry-run` adds `--out` to the `.gitignore` at the root of the
+git repository that contains it (or to `./.gitignore` outside a repository), once. Keep the directory off
+shared drives too.
+
+`dump` uses `--no-owner --no-privileges`, which drops ownership but not the objects themselves: every
+function, trigger, rule and foreign server in the source is restored (event triggers and user mappings only
+with the `--keep-*` flags above). `audit` lists them so a
+person can confirm each is the app's own; in breach mode the signed-off report is required before the final dump.
 
 Flag rationale: directory format is the only one that supports parallel `--jobs`; `--no-owner
 --no-privileges` strip Railway role references; `--no-subscriptions --no-publications` avoid dragging
@@ -86,7 +125,9 @@ port=<port> dbname=railway user=repl password=... sslmode=require' PUBLICATION a
 instance needs an outbound route to Railway's public TCP proxy (NAT on the private subnets, or a
 publicly accessible instance during migration). Cutover: stop writes, wait for lag 0, **resync
 sequences** (not replicated), flip, `DROP SUBSCRIPTION` (an orphaned slot fills Railway's volume).
-Limitations: no DDL, no sequences, no large objects.
+Limitations: no DDL, no sequences, no large objects. *(Breach mode only)* The proxy stays up for the
+whole replication period, so create the replication role after the password rotation, give it a fresh
+password, and delete the proxy right after `DROP SUBSCRIPTION` at cutover.
 
 **AWS DMS**: works in principle (self-managed PG source over the proxy, SSL `require`, needs a superuser
 for CDC) but adds a replication instance, does not migrate sequences, and PG 17/18 sources are not

@@ -25,3 +25,7 @@ migration/.secrets/
 .env
 .env.*
 !.env.example
+
+# OS and local review tooling
+.DS_Store
+.lavish/

@@ -28,6 +28,7 @@ infra/
   live/<project>/<env>/ one root per project per environment = one state file, one set of CI roles
   Makefile  .tflint.hcl  .pre-commit-config.yaml  .gitignore
 .github/workflows/terraform.yml  deploy.yml
+.github/dependabot.yml
 ```
 
 Order: `bootstrap` (apply, then migrate its own state into the bucket) -> `network` -> `platform`

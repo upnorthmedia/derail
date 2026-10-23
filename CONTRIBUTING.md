@@ -30,12 +30,15 @@ tflint --recursive
 
 # Scripts
 shellcheck -S warning scripts/*.sh
+shellcheck -x -S warning scripts/tests/*.sh scripts/lib/*.sh
+for t in scripts/tests/*.sh; do bash "$t"; done   # BASH_UNDER_TEST=/bin/bash for macOS bash 3.2
+# test_pg_audit.sh needs docker and psql/pg_dump/pg_restore >= 17 (it starts postgres:17); it SKIPs without them
 python3 -m py_compile scripts/*.py
 python3 scripts/scan_codebase.py evals/payload-cms-vercel-railway/files/lumen --stdout --json-only | head
 python3 scripts/estimate_cost.py --tier shared
 
 # Skill structure (from the skill-creator skill, if you have it)
-python3 -m scripts.quick_validate /path/to/railway-to-aws
+python3 -m scripts.quick_validate /path/to/derail
 ```
 
 ## Adding an eval case

@@ -12,10 +12,16 @@
 #   preflight  versions, size, extensions (and availability on target), tables without PK, roles
 #   dump       pg_dump -Fd -jN --compress=zstd --no-owner --no-privileges ... + counts/checksums
 #   restore    create DB + extensions, pg_restore -jN --no-owner --no-privileges --no-comments
-#              [--role], ANALYZE, counts/checksums diff -> OK / MISMATCH
+#              [--role], ANALYZE, counts/checksums diff -> OK / MISMATCH. Skips the dump's event
+#              triggers and user mappings unless --keep-event-triggers / --keep-user-mappings. With
+#              --role and foreign servers in the dump, grants the role USAGE on their wrappers for the
+#              pg_restore only
 #   verify     re-run counts/checksums on both sides and diff
 #   roles      render sql/app_roles.sql.tpl and apply (passwords via APP_RW_PASSWORD /
 #              APP_MIGRATE_PASSWORD env, read inside psql with \getenv; never echoed)
+#   audit      read-only security inventory of the source (SRC_URL only): roles, SECURITY DEFINER
+#              functions, triggers, event triggers, rules, extensions, schemas, FDWs, publications,
+#              live connections -> <out>/db-audit-<stamp>.md with a sign-off checklist (sql/audit.sql)
 #
 # Nothing secret is ever printed: URLs are masked in all output, including --dry-run.
 set -euo pipefail
@@ -35,21 +41,32 @@ APP_MIGRATE="app_migrate"
 EXIT_ON_ERROR=1
 CLEAN=0
 PG_MAJOR_CHECK=0
+KEEP_EVENT_TRIGGERS=0
+KEEP_USER_MAPPINGS=0
 EXCLUDE_TABLE_DATA=()
 
 usage() {
   cat <<'EOF'
 Usage: SRC_URL=... TGT_URL=... pg_migrate.sh <preflight|dump|restore|verify|roles> [options]
+       SRC_URL=... pg_migrate.sh audit [--out DIR] [--dry-run]
 
 Options:
   --out DIR          working directory for dumps/logs (default migration/db)
   --jobs N           parallel jobs for pg_dump/pg_restore (default 4)
   --target-db NAME   application database on the target (default: db name from SRC_URL, else "app")
   --role ROLE        pg_restore --role (objects owned by this role; e.g. app_owner). Requires
-                     the role to exist and the master user to be a member (see `roles`).
+                     the role to exist and the master user to be a member (see `roles`). If the dump has
+                     foreign servers, restore grants the role USAGE on the foreign-data wrappers for the
+                     pg_restore and revokes it afterwards.
   --dump-dir DIR     dump directory for restore/verify (default: <out>/LATEST pointer)
   --clean            restore with --clean --if-exists (re-runnable into a scratch DB)
   --no-exit-on-error restore without --exit-on-error (tolerate benign RDS errors)
+  --keep-event-triggers  restore: also restore the dump's event triggers (skipped by default and named in
+                     a NOTE). CREATE EVENT TRIGGER needs superuser (RDS: the main user), so use it without
+                     --role; RDS requires event triggers to be dropped before a major version upgrade.
+  --keep-user-mappings   restore: also restore the dump's foreign-server user mappings (skipped by default
+                     and named in a NOTE). Each one recreates a stored credential for another server, and
+                     one whose role does not exist on the target aborts the restore.
   --exclude-table-data PATTERN   dump: pass through to pg_dump --exclude-table-data (schema kept, rows
                      skipped). Repeatable. Typical: --exclude-table-data='spatial_ref_sys' (PostGIS
                      populates it from the extension; restoring the rows conflicts), session/log/cache tables.
@@ -61,7 +78,7 @@ Options:
   -h, --help         this help
 
 Environment:
-  SRC_URL, TGT_URL   required (both), see header. PGSSLMODE defaults to "require"; PGTZ is forced to UTC.
+  SRC_URL, TGT_URL   required (both), see header; `audit` needs SRC_URL only. PGSSLMODE defaults to "require"; PGTZ is forced to UTC.
   APP_RW_PASSWORD, APP_MIGRATE_PASSWORD   required by `roles` only.
 
 Exit codes: 0 ok, 1 failure/mismatch, 2 usage error.
@@ -71,7 +88,7 @@ EOF
 [ $# -ge 1 ] || { usage >&2; exit 2; }
 CMD="$1"; shift
 case "$CMD" in
-  preflight|dump|restore|verify|roles) ;;
+  preflight|dump|restore|verify|roles|audit) ;;
   -h|--help) usage; exit 0 ;;
   *) echo "error: unknown subcommand '$CMD'" >&2; usage >&2; exit 2 ;;
 esac
@@ -88,6 +105,8 @@ while [ $# -gt 0 ]; do
     --exclude-table-data) EXCLUDE_TABLE_DATA+=("${2:-}"); shift 2 ;;
     --exclude-table-data=*) EXCLUDE_TABLE_DATA+=("${1#*=}"); shift ;;
     --pg-major-check) PG_MAJOR_CHECK=1; shift ;;
+    --keep-event-triggers) KEEP_EVENT_TRIGGERS=1; shift ;;
+    --keep-user-mappings) KEEP_USER_MAPPINGS=1; shift ;;
     --app-owner) APP_OWNER="${2:-}"; shift 2 ;;
     --app-rw) APP_RW="${2:-}"; shift 2 ;;
     --app-migrate) APP_MIGRATE="${2:-}"; shift 2 ;;
@@ -101,21 +120,35 @@ done
 for tool in psql pg_dump pg_restore; do
   command -v "$tool" >/dev/null 2>&1 || { echo "error: $tool not found (install PostgreSQL client tools >= source major)" >&2; exit 1; }
 done
-if [ -z "${SRC_URL:-}" ] || [ -z "${TGT_URL:-}" ]; then
+if [ "$CMD" = "audit" ]; then
+  # audit reads the source only; TGT_URL is not needed (and not checked) here
+  if [ -z "${SRC_URL:-}" ]; then
+    echo "error: SRC_URL must be set in the environment (never pass it as an argument)." >&2
+    echo "       e.g.  read -rs SRC_URL; export SRC_URL   (or source migration/.secrets/db.env)" >&2
+    exit 2
+  fi
+  TGT_URL=""
+elif [ -z "${SRC_URL:-}" ] || [ -z "${TGT_URL:-}" ]; then
   echo "error: SRC_URL and TGT_URL must both be set in the environment (never pass them as arguments)." >&2
   echo "       e.g.  read -rs SRC_URL; export SRC_URL   (or source migration/.secrets/db.env)" >&2
   exit 2
 fi
 case "$SRC_URL" in postgres://*|postgresql://*) ;; *) echo "error: SRC_URL must start with postgresql://" >&2; exit 2 ;; esac
-case "$TGT_URL" in postgres://*|postgresql://*) ;; *) echo "error: TGT_URL must start with postgresql://" >&2; exit 2 ;; esac
+if [ "$CMD" != "audit" ]; then
+  case "$TGT_URL" in postgres://*|postgresql://*) ;; *) echo "error: TGT_URL must start with postgresql://" >&2; exit 2 ;; esac
+fi
 
 export PGTZ=UTC
 export PGSSLMODE="${PGSSLMODE:-require}"
 export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-15}"
 export PGOPTIONS="${PGOPTIONS:-} -c statement_timeout=0"
 
-# mask user:password@ in any URL-looking string
-mask() { printf '%s' "$1" | sed -E 's#(://[^:/@]*):[^@]*@#\1:***@#g'; }
+# mask secrets in connection strings: user:password@ in URLs; password= / sslpassword= as a URL query
+# parameter (value ends at & or whitespace); and in key=value conninfo (value ends at whitespace, or is
+# single-quoted with \' escapes; spaces around = allowed); and pg_dump's option syntax
+# ("password" '...', as in a CREATE USER MAPPING echoed by a failed pg_restore)
+mask_stream() { sed -E -e 's#(://[^:/@]*):[^@]*@#\1:***@#g' -e 's#([?&])(ssl)?password=[^&[:space:]]*#\1\2password=***#g' -e 's#(^|[[:space:]])(ssl)?password[[:space:]]*=[[:space:]]*('"'"'([^'"'"'\\]|\\.)*'"'"'|[^[:space:]]*)#\1\2password=***#g' -e 's#("(ssl)?password"[[:space:]]+)'"'"'([^'"'"']|'"'"''"'"')*'"'"'#\1'"'"'***'"'"'#g'; }
+mask() { printf '%s' "$1" | mask_stream; }
 # db name from a URL path (postgresql://.../NAME?x=y)
 url_db() { printf '%s' "$1" | sed -nE 's#^[a-z]+://[^/]*/([^?]*).*$#\1#p'; }
 # replace the db name in a URL (keeps query string)
@@ -127,6 +160,10 @@ APP_URL="$(url_with_db "$TGT_URL" "$TARGET_DB")"
 MASTER_USER="$(printf '%s' "$TGT_URL" | sed -nE 's#^[a-z]+://([^:/@]+)(:[^@]*)?@.*#\1#p')"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
+# Everything this script and pg_dump write is private to the user (files 600, new directories 700): the
+# dump holds every row plus any user-mapping password in plain text, and a failed restore's log repeats
+# the failing statement. Files left by earlier runs keep their mode.
+umask 077
 mkdir -p "$OUT"
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
@@ -146,8 +183,17 @@ pq_at() { local url="$1"; shift; if [ "$DRY_RUN" -eq 1 ]; then echo "<dry-run>";
 
 echo "== pg_migrate $CMD"
 echo "   source : $(mask "$SRC_URL")"
-echo "   target : $(mask "$TGT_URL")  (app db: $TARGET_DB)"
+if [ "$CMD" = "audit" ]; then
+  echo "   target : (not used by audit)"
+else
+  echo "   target : $(mask "$TGT_URL")  (app db: $TARGET_DB)"
+fi
 echo "   out    : $OUT   jobs: $JOBS   sslmode: $PGSSLMODE   dry-run: $DRY_RUN"
+# --out holds full production data (and any user-mapping password in the dump): keep it out of git, the
+# same way the inventory scripts keep their secrets dir out
+# shellcheck source=lib/gitignore.sh
+. "$SCRIPT_DIR/lib/gitignore.sh"
+[ "$DRY_RUN" -eq 1 ] || gitignore_add_dir "$OUT"
 
 major_of() { printf '%s' "$1" | sed -nE 's/^[^0-9]*([0-9]+).*/\1/p'; }
 pg_dump_major() { major_of "$(pg_dump --version | sed -nE 's/.* ([0-9]+)(\.[0-9]+)?.*/\1/p')"; }
@@ -194,7 +240,7 @@ do_preflight() {
     pq_at "$SRC_URL" -c "SELECT DISTINCT pg_get_userbyid(relowner) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')"
     echo "## tables without primary key (checksums fall back to full-row ordering; logical replication would need REPLICA IDENTITY FULL)"
     pq_at "$SRC_URL" -c "SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast','pgbouncer') AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisprimary) ORDER BY 1"
-    echo "## publications / subscriptions / event triggers on source (skipped by dump flags)"
+    echo "## publications / subscriptions (skipped by dump flags) / event triggers (carried by the dump) on source"
     pq_at "$SRC_URL" -c "SELECT 'publication: '||pubname FROM pg_publication UNION ALL SELECT 'subscription: '||subname FROM pg_subscription UNION ALL SELECT 'event trigger: '||evtname FROM pg_event_trigger"
     echo "## target"
     tgt_ver="$(pq_at "$TGT_URL" -c 'SELECT version()')"; echo "$tgt_ver"
@@ -248,7 +294,7 @@ do_dump() {
     --no-subscriptions --no-publications \
     --quote-all-identifiers \
     --exclude-schema=pgbouncer \
-    "${excl[@]}" \
+    ${excl[@]+"${excl[@]}"} \
     --file="$dir/data"
   if [ "$DRY_RUN" -eq 0 ]; then
     excl_json="$(printf '%s\n' "${EXCLUDE_TABLE_DATA[@]:-}" | grep -v '^$' | sed 's/"/\\"/g; s/^/"/; s/$/"/' | paste -sd, - || true)"
@@ -257,6 +303,13 @@ do_dump() {
     log "dump complete: $dir  ($(du -sh "$dir/data" 2>/dev/null | cut -f1))"
     log "NOTE: anything committed on the source after the dump started is not included. Stop writes before the final dump."
   fi
+}
+
+# toc_names <toc-file> <KIND>: comma-separated names of the TOC entries of one kind ("EVENT TRIGGER",
+# "USER MAPPING"); a TOC line is "<id>; <catalog> <oid> <KIND> - <name> <owner>"
+toc_names() {
+  { grep -E "^[0-9]+; [0-9]+ [0-9]+ $2 - " "$1" || true; } \
+    | sed -E "s/^[0-9]+; [0-9]+ [0-9]+ $2 - ($2 )?(.*) [^ ]*\$/\2/" | paste -sd, - | sed 's/,/, /g'
 }
 
 resolve_dump_dir() {
@@ -268,6 +321,45 @@ resolve_dump_dir() {
   if [ "$DRY_RUN" -eq 0 ] && [ ! -d "$DUMP_DIR/data" ]; then
     echo "error: $DUMP_DIR/data is not a pg_dump directory" >&2; exit 1
   fi
+}
+
+# fdw_grant / fdw_revoke: a foreign server in the dump needs USAGE on its foreign-data wrapper, which the
+# master created in restore step 2 and --role lacks ("permission denied for foreign-data wrapper"). Grant
+# it only on wrappers the role lacks it on (so a grant made by someone else is never revoked), for the
+# pg_restore only; fdw_revoke takes exactly those back, also on failure (EXIT trap). The privilege is
+# read back after each GRANT/REVOKE: one run by a role that holds USAGE without the grant option only
+# warns ("no privileges were granted") and exits 0.
+FDW_GRANTED=""
+fdw_usage() { pq_at "$APP_URL" -c "SELECT has_foreign_data_wrapper_privilege('$ROLE', '$1', 'USAGE')"; }
+fdw_grant() {
+  local fdws f
+  fdws="$(pq_at "$APP_URL" -c "SELECT fdwname FROM pg_foreign_data_wrapper WHERE NOT has_foreign_data_wrapper_privilege('$ROLE', oid, 'USAGE') ORDER BY 1")"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    pq "$APP_URL" -c "GRANT USAGE ON FOREIGN DATA WRAPPER \"$f\" TO \"$ROLE\"" || true
+    if [ "$(fdw_usage "$f")" = "t" ]; then
+      FDW_GRANTED="$FDW_GRANTED$f"$'\n'
+      log "granted USAGE on foreign-data wrapper $f to $ROLE for this restore (the dump has foreign servers)"
+    else
+      log "WARN: could not grant USAGE on foreign-data wrapper $f to $ROLE, so pg_restore will fail on its servers."
+      log "      Fallback: restore without --role (the restored objects are then owned by the master user)."
+    fi
+  done <<<"$fdws"
+  if [ -n "$FDW_GRANTED" ]; then trap fdw_revoke EXIT; fi
+}
+fdw_revoke() {
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    pq "$APP_URL" -c "REVOKE USAGE ON FOREIGN DATA WRAPPER \"$f\" FROM \"$ROLE\"" || true
+    if [ "$(fdw_usage "$f")" = "f" ]; then
+      log "revoked USAGE on foreign-data wrapper $f from $ROLE"
+    else
+      log "WARN: could not revoke USAGE on foreign-data wrapper $f from $ROLE; run it as the master user."
+    fi
+  done <<<"$FDW_GRANTED"
+  FDW_GRANTED=""
+  trap - EXIT
 }
 
 # ---------------------------------------------------------------- restore
@@ -320,11 +412,23 @@ do_restore() {
   fi
 
   # 3. TOC filter: skip SCHEMA/EXTENSION entries we pre-created above (otherwise pg_restore fails
-  #    with "already exists" under --exit-on-error). Everything else is restored.
+  #    with "already exists" under --exit-on-error). Also skip, unless asked for, EVENT TRIGGER entries
+  #    (need superuser, so they abort a --role restore; RDS needs them dropped before a major version
+  #    upgrade) and USER MAPPING entries (each recreates another server's stored credential, and aborts
+  #    the restore when its role is missing on the target). Everything else is restored.
   local args=(--dbname="$APP_URL" --jobs="$JOBS" --no-owner --no-privileges --no-comments --verbose)
   [ -n "$ROLE" ] && args+=(--role="$ROLE")
   [ "$CLEAN" -eq 1 ] && args+=(--clean --if-exists)
   [ "$EXIT_ON_ERROR" -eq 1 ] && args+=(--exit-on-error)
+  if [ "$KEEP_EVENT_TRIGGERS" -eq 1 ]; then
+    log "WARN: --keep-event-triggers: RDS requires event triggers to be dropped before a major version upgrade,"
+    log "      and CREATE EVENT TRIGGER needs superuser (RDS: the main user), so run restore without --role."
+    [ -n "$ROLE" ] && log "WARN: --keep-event-triggers with --role $ROLE: any event trigger in the dump will fail (\"must be superuser\"); run restore without --role."
+  fi
+  if [ "$KEEP_USER_MAPPINGS" -eq 1 ]; then
+    log "WARN: --keep-user-mappings: each mapping recreates a stored credential for another server on the target,"
+    log "      and a mapping whose role does not exist on the target aborts the restore."
+  fi
   if [ "$DRY_RUN" -eq 0 ]; then
     local toc="$OUT/toc-$STAMP.list"
     pg_restore -l "$DUMP_DIR/data" >"$toc"
@@ -337,7 +441,38 @@ do_restore() {
     fi
     grep -Ev "$skip_re" "$toc" >"$toc.filtered" || true
     log "TOC: $(grep -c '^[0-9]' "$toc") entries, $(( $(grep -c '^[0-9]' "$toc") - $(grep -c '^[0-9]' "$toc.filtered") )) pre-created entries skipped"
+    local n_evt n_um drop_re='^$'
+    n_evt="$(grep -cE '^[0-9]+; [0-9]+ [0-9]+ EVENT TRIGGER - ' "$toc" || true)"
+    n_um="$(grep -cE '^[0-9]+; [0-9]+ [0-9]+ USER MAPPING - ' "$toc" || true)"
+    if [ "$n_evt" -gt 0 ]; then
+      if [ "$KEEP_EVENT_TRIGGERS" -eq 1 ]; then
+        log "keeping $n_evt event trigger(s) (--keep-event-triggers): $(toc_names "$toc" 'EVENT TRIGGER')"
+      else
+        drop_re="$drop_re|^[0-9]+; [0-9]+ [0-9]+ EVENT TRIGGER - "
+        log "NOTE: skipped $n_evt event trigger(s) from the dump: $(toc_names "$toc" 'EVENT TRIGGER')."
+        log "      Check them against the db-audit report (section 6). --keep-event-triggers restores them (without --role)."
+      fi
+    fi
+    if [ "$n_um" -gt 0 ]; then
+      if [ "$KEEP_USER_MAPPINGS" -eq 1 ]; then
+        log "keeping $n_um user mapping(s) (--keep-user-mappings): $(toc_names "$toc" 'USER MAPPING')"
+      else
+        drop_re="$drop_re|^[0-9]+; [0-9]+ [0-9]+ USER MAPPING - "
+        log "NOTE: skipped $n_um user mapping(s) from the dump: $(toc_names "$toc" 'USER MAPPING')."
+        log "      Each stores a credential for another server (treat it as exposed). --keep-user-mappings restores them."
+      fi
+    fi
+    if [ "$drop_re" != '^$' ]; then
+      grep -Ev "$drop_re" "$toc.filtered" >"$toc.filtered.tmp" || true
+      mv "$toc.filtered.tmp" "$toc.filtered"
+    fi
     args+=(--use-list="$toc.filtered")
+    if [ -n "$ROLE" ] && grep -qE '^[0-9]+; [0-9]+ [0-9]+ SERVER - ' "$toc.filtered"; then fdw_grant; fi
+  else
+    echo "  (would skip EVENT TRIGGER / USER MAPPING entries in the dump unless --keep-event-triggers / --keep-user-mappings)"
+    if [ -n "$ROLE" ]; then
+      echo "  (if the dump has foreign servers: would GRANT USAGE ON FOREIGN DATA WRAPPER to $ROLE for the pg_restore, then REVOKE it)"
+    fi
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
     run_cmd pg_restore "${args[@]}" --use-list="$OUT/toc-<stamp>.list.filtered" "$DUMP_DIR/data"
@@ -346,15 +481,16 @@ do_restore() {
     printf '  $ %s\n' "${shown[*]}"
     if ! pg_restore "${args[@]}" "$DUMP_DIR/data" >"$logf" 2>&1; then
       log "pg_restore FAILED; error lines from $logf (first 10):"
-      grep -nE 'pg_restore: (error|warning)|^ERROR:|^DETAIL:' "$logf" | head -n 10 | sed -E 's#(://[^:/@]*):[^@]*@#\1:***@#g'
+      grep -nE 'pg_restore: (error|warning)|^ERROR:|^DETAIL:' "$logf" | head -n 10 | mask_stream
       log "last lines:"
-      tail -n 5 "$logf" | sed -E 's#(://[^:/@]*):[^@]*@#\1:***@#g'
+      tail -n 5 "$logf" | mask_stream
       if grep -q 'duplicate key value violates unique constraint "spatial_ref_sys_pkey"' "$logf"; then
         log "HINT: PostGIS spatial_ref_sys rows conflict with the ones CREATE EXTENSION inserted: re-run dump with --exclude-table-data='spatial_ref_sys'"
       fi
       exit 1
     fi
     log "pg_restore ok (log: $logf, $(grep -c 'pg_restore:' "$logf" || true) lines)"
+    if [ -n "$FDW_GRANTED" ]; then fdw_revoke; fi
   fi
 
   # 4. post: ANALYZE, verify
@@ -438,10 +574,73 @@ do_roles() {
   log "roles applied. Store the two passwords in Secrets Manager (put_secrets.sh); never in Terraform state."
 }
 
+# ---------------------------------------------------------------- audit
+# Read-only inventory of what pg_dump would carry over (and who can log in), for a person to sign off
+# before the final dump. After a credential leak the source may hold objects an intruder added.
+do_audit() {
+  local rep="$OUT/db-audit-$STAMP.md"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    run_cmd psql "$SRC_URL" -X -q -v ON_ERROR_STOP=1 -f "$SQL_DIR/audit.sql"
+    echo "  (would write $rep)"
+    return 0
+  fi
+  local tmp="$rep.partial"
+  {
+    echo "# Database audit $STAMP"
+    echo
+    echo "Source: \`$(mask "$SRC_URL")\` (read-only session). Generated by \`pg_migrate.sh audit\` from \`sql/audit.sql\`."
+    echo "No row data, passwords, function bodies or query text are included: functions are identified by"
+    echo "length and a SHA-256 prefix of their definition, so re-run after cleanup and diff two reports."
+    echo
+  } >"$tmp"
+  if ! psql "$SRC_URL" -X -q -v ON_ERROR_STOP=1 -f "$SQL_DIR/audit.sql" >>"$tmp"; then
+    rm -f "$tmp"
+    log "audit FAILED (psql error above); no report written"
+    exit 1
+  fi
+  cat >>"$tmp" <<'EOF'
+
+## Sign-off
+
+`dump` passes `--no-owner --no-privileges --no-publications --no-subscriptions`, so roles, grants,
+publications and subscriptions are not copied. Everything else listed above that lives in this
+database is: functions, triggers, event triggers, rules, schemas, extensions, foreign servers and
+user mappings (a user mapping's options, including any password, are written to the dump in plain text).
+`restore` then skips event triggers and user mappings unless given --keep-event-triggers /
+--keep-user-mappings; everything else is recreated on the target.
+
+- [ ] 1-2. Every role is known and has a purpose; no unexpected login, superuser, createrole,
+      bypassrls or replication attribute, valid_until or membership (e.g. pg_read_server_files,
+      pg_execute_server_program). Unknown roles are not recreated on the target.
+- [ ] 3. Every per-role / per-database setting name is expected.
+- [ ] 4. Every SECURITY DEFINER function is the app's own (owner, language, set_options includes
+      search_path); extension-owned ones match the extension list.
+- [ ] 5. Every trigger and the function it calls comes from the app's migrations.
+- [ ] 6. Event triggers: none, or each is explained.
+- [ ] 7. Every rule is explained.
+- [ ] 8. Every extension is one the app uses (untrusted languages, dblink and *_fdw need a reason).
+- [ ] 9-10. Every schema and object owner is expected.
+- [ ] 11. Foreign servers / user mappings: none, or each is explained (a mapping stores credentials
+      for another server: treat those as exposed too, and drop unexplained ones before dumping).
+- [ ] 12. Publications / subscriptions: none, or each is explained (one you did not create may mean
+      data was replicated out).
+- [ ] 13. Every connected user, application_name and client_addr is yours.
+- [ ] Anything unexplained is recorded in BREACH.md, removed on the source (or excluded from the
+      dump), and this audit is re-run and diffed before the final dump.
+
+Signed off by: ____________________  Date (UTC): ____________
+EOF
+  mv "$tmp" "$rep"
+  # stdout summary: row count per section (psql table footers), nothing else from the report
+  awk '/^## [0-9]/ { h = $0; sub(/^## /, "", h); sub(/ \(.*$/, "", h) } /^\([0-9]+ rows?\)$/ { gsub(/[()]/, ""); printf "   %-60s %s\n", h, $0 }' "$rep"
+  log "audit report: $rep  (review every section and complete the sign-off checklist)"
+}
+
 case "$CMD" in
   preflight) do_preflight ;;
   dump) do_dump ;;
   restore) do_restore ;;
   verify) do_verify ;;
   roles) do_roles ;;
+  audit) do_audit ;;
 esac

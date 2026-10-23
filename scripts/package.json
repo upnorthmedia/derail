@@ -1,8 +1,8 @@
 {
-  "name": "railway-to-aws-scripts",
+  "name": "derail-scripts",
   "version": "0.1.0",
   "private": true,
-  "description": "Node helpers for the railway-to-aws skill (Vercel Blob -> S3 copy). Install with: npm install (in this directory).",
+  "description": "Node helpers for the derail skill (Vercel Blob -> S3 copy). Install with: npm install (in this directory).",
   "type": "module",
   "engines": { "node": ">=20" },
   "scripts": {

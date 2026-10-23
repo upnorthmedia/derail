@@ -85,6 +85,24 @@ jobs:
           python3 scripts/estimate_cost.py --tier shared --spot-web --cron --json > /dev/null
       - name: help texts
         run: for s in scripts/*.sh; do bash "$s" --help > /dev/null; done
+      - name: shellcheck tests and lib
+        run: shellcheck -x -S warning scripts/tests/*.sh scripts/lib/*.sh
+      # The runner image ships PostgreSQL 16 clients; test_pg_audit.sh runs a postgres:17 server, and
+      # pg_dump refuses to dump a newer server. Add the PGDG repository and its client 17, and put its bin
+      # directory first on PATH: the runner's pg_wrapper keeps picking 16 even with 17 installed.
+      - name: postgres client 17 (PGDG)
+        run: |
+          sudo apt-get install -y -qq postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y -qq postgresql-client-17
+          /usr/lib/postgresql/17/bin/pg_dump --version
+          echo /usr/lib/postgresql/17/bin >> "$GITHUB_PATH"
+      - name: check the postgres client on PATH is 17
+        run: pg_dump --version | grep ' 17\.'
+      - name: script test suites
+        run: |
+          set -e
+          for t in scripts/tests/*.sh; do echo "== $t"; bash "$t"; done
 
   workflows:
     name: actionlint (shipped workflow templates)

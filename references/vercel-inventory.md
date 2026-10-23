@@ -56,7 +56,7 @@ protection), `filter_project_envs` (names/types; values stay encrypted), `list_p
 
 | Vercel | Export | AWS equivalent | Gotchas |
 |---|---|---|---|
-| Project (Next.js, Node 24) | `project inspect` | ECS Fargate service (default) or OpenNext (see aws-target-architecture.md) | Match the Node major in the Dockerfile. |
+| Project (Next.js, Node 24) | `project inspect` | ECS Fargate service (default) or OpenNext (see aws-target-architecture.md) | Match the Node major in the Dockerfile (tag and digest on its `FROM ... AS base` line). |
 | Env vars Config | `env pull` | `plain_env` (task definition) or build args for `NEXT_PUBLIC_*` | `NEXT_PUBLIC_*` are inlined at build: Docker build args. |
 | Env vars Secret | not exportable | `secret_keys` + `scripts/put_secrets.sh` with re-sourced values | Plan the rotation list explicitly. |
 | System vars (`VERCEL_URL`, `VERCEL_ENV`, `VERCEL_GIT_COMMIT_SHA`, `VERCEL_PROJECT_PRODUCTION_URL`) | grep code | `APP_URL`, `NODE_ENV`, `GIT_SHA` set by you | Code reading `VERCEL_URL` for absolute URLs breaks silently. |

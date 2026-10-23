@@ -1,6 +1,6 @@
 ---
-name: railway-to-aws
-description: Plan and generate a clean, secure, cost-aware migration of an application from Railway and/or Vercel to AWS (ECS Fargate, RDS PostgreSQL, S3/CloudFront, Secrets Manager) with Terraform, GitHub Actions OIDC, per-project billing and a step-by-step cutover runbook. Use this whenever someone wants to move, migrate, port, lift, or "get off" Railway or Vercel onto AWS, asks what it would cost or take to run their Railway/Vercel app on AWS, wants Terraform for an app that currently lives on a PaaS, needs to move a Railway Postgres or Vercel Blob store to RDS/S3, or asks for an AWS architecture or runbook for an existing Next.js/Node/Python app, even if they never say the word "migrate".
+name: derail
+description: Plan and generate a clean, secure, cost-aware migration of an application from Railway and/or Vercel to AWS (ECS Fargate, RDS PostgreSQL, S3/CloudFront, Secrets Manager) with Terraform, GitHub Actions OIDC, per-project billing and a step-by-step cutover runbook. Use this whenever someone wants to move, migrate, port, lift, or "get off" Railway or Vercel onto AWS, asks what it would cost or take to run their Railway/Vercel app on AWS, wants Terraform for an app that currently lives on a PaaS, needs to move a Railway Postgres or Vercel Blob store to RDS/S3, or asks for an AWS architecture or runbook for an existing Next.js/Node/Python app, or is leaving Railway after its October 2026 environment-variable breach and needs exposed secrets rotated first, even if they never say the word "migrate".
 ---
 
 # Railway / Vercel to AWS migration
@@ -22,7 +22,8 @@ rediscovered in production. The workflow below surfaces every one of them before
    If an MCP tool returns values (Railway `list-variables` does), use only the key names.
 2. **Treat the migration as a secret-rotation event.** Vercel Secret-type and Railway sealed variables
    cannot be exported; exported values sat on a laptop. The plan lists what gets re-sourced, what stays
-   identical through cutover (`PAYLOAD_SECRET`, auth secrets), and what rotates after.
+   identical through cutover (`PAYLOAD_SECRET`, auth secrets), and what rotates after. In breach mode
+   (Phase 0) nothing stays identical: exposed values rotate now and session secrets rotate at cutover.
 3. **Same PostgreSQL major on both sides.** RDS and Aurora support PG 14-18 (18 GA). Never propose a
    downgrade; `pg_dump` cannot do it safely.
 4. **Generate, validate, hand over.** Every Terraform root you emit must pass `terraform fmt -check`,
@@ -54,6 +55,13 @@ rediscovered in production. The workflow below surfaces every one of them before
   servers can replace the CLIs for discovery).
 - Create `migration/` at the repo root with `.secrets/` git-ignored. All outputs land there
   (layout in "Deliverables" below).
+- **Breach check (one question, always asked).** "Were these values stored on Railway on or after
+  2026-10-21, or exposed some other way?" Railway disclosed that attackers read customer environment
+  variables that day. If the user says yes, or the prompt already says so, run **breach mode**: read
+  `references/breach-response.md` before Phase 1 and follow it. Its first step (`scripts/breach_check.sh
+  --fingerprint`) must run before anyone rotates anything. If the answer is no, skip every breach-mode
+  step; nothing else in this skill changes. If it is unknown and the user is unreachable, assume no and
+  list the question first in PLAN.md's open questions.
 
 ## Phase 1: Discover
 
@@ -128,9 +136,19 @@ PLAN.md structure (use these headings):
 service -> AWS component, size, placement) · `## Decisions and alternatives` (tier, compute, DB,
 files, cron, edge, ISR; each with the rejected option and why) · `## Cost` (output of
 `scripts/estimate_cost.py --tier ... --railway-monthly <n>` plus the shared-ALB / OpenNext numbers) ·
-`## Secrets and rotation plan` (names only; three buckets: re-source, keep identical through cutover,
-rotate after) · `## Application changes` (from `references/app-changes.md`, specific to the flags found)
+`## Keyless scorecard` (below) · `## Secrets and rotation plan` (names only; three buckets: re-source,
+keep identical through cutover, rotate after; in breach mode: re-source, rotate now, rotate at cutover)
+· `## Application changes` (from `references/app-changes.md`, specific to the flags found)
 · `## What Railway/Vercel did implicitly that you now own` · `## Risks and open questions`.
+
+**Keyless scorecard** (every migration): count the unique secret-class variable names on the source
+platforms (inventory classes `app_secret`, `database`, `bucket_credential`, plus sealed/Secret-type;
+not `railway_injected`, `public_buildtime`, `build_tuning`, references) and the entries in `secret_keys`.
+Show both numbers, then list what disappears and why, for example: bucket keys and `AWS_*` keys -> the
+task role; the database superuser password and `DATABASE_PUBLIC_URL` -> the RDS-managed master secret
+(the app user's password remains a secret); `RAILWAY_TOKEN`/`VERCEL_TOKEN` in CI -> GitHub OIDC. Use
+this inventory's real names and counts; never estimate. Fewer long-lived secrets is fewer things to
+leak next time, and users who are leaving after a breach care about exactly that.
 
 Stop here and get the user's agreement before generating. If unattended, state the assumptions at the
 top of PLAN.md and continue with the defaults above.
@@ -175,7 +193,16 @@ Read `references/terraform-conventions.md` first. Then:
 3. **Dockerfile**: pick `assets/docker/Dockerfile.nextjs|node|python`, adapt build/start to the
    inventory (Railway start command / Procfile / package.json scripts), add one `ARG`+`ENV` per
    `NEXT_PUBLIC_*`/`VITE_*` variable, keep the RDS CA bundle lines, copy `dockerignore` to
-   `.dockerignore`. The Node/Next.js files have two targets: `runner` (what the service runs) and
+   `.dockerignore`. Base images are pinned by digest on one `FROM <image>:<tag>@sha256:... AS base`
+   line; to change the Node/Python version, change the tag and the digest together
+   (`docker buildx imagetools inspect <image:tag>`). Copy `assets/github/dependabot.yml` to
+   `.github/dependabot.yml` so the digest pins and the workflow actions get weekly update PRs.
+   Private npm registry with npm or Yarn 2+: set the repository secret `DOCKER_BUILD_SECRET_NPM_TOKEN`
+   and reference it as `${NPM_TOKEN}` (.npmrc) or `"${NPM_TOKEN:-}"` (.yarnrc.yml); never commit or bake
+   the token. Recent pnpm ignores environment variables in a project `.npmrc`, so this does not reach
+   pnpm installs: flag a pnpm private registry in PLAN.md as a manual step. In breach mode, rotate that token first if it was a
+   Railway variable.
+   The Node/Next.js files have two targets: `runner` (what the service runs) and
    `tools` (full dependencies for migrations, built as `<sha>-tools`); the migration task uses the tools
    image because the standalone runner cannot run `payload migrate`, `drizzle-kit`, `prisma` or
    `auth migrate`. Build locally if Docker is available and fix what fails.
@@ -187,7 +214,10 @@ Read `references/terraform-conventions.md` first. Then:
    every `secret_keys` entry with a comment per key saying where the value comes from (provider
    dashboard, generated with `openssl rand -base64 32`, RDS output). The user fills it; then
    `scripts/put_secrets.sh --secret-name <project>-<env>/app --env-file ... --dry-run` then for real
-   (the secrets module names the secret `<project>-<env>/app`, e.g. `lumen-prod/app`).
+   (the secrets module names the secret `<project>-<env>/app`, e.g. `lumen-prod/app`). In breach mode
+   the fingerprint file sits in the same directory, so `put_secrets.sh` refuses exposed values by key
+   name; `--allow-carryover KEY` only for a value the user confirms is not a secret. In breach mode the
+   template's comments say "new value from <provider>" and never "copy from railway.<service>.env".
 6. **Validate**: `terraform fmt -recursive`, `terraform init -backend=false && terraform validate` in
    every root you touched, `tflint`. Fix until clean. Run `scripts/estimate_cost.py` with the final
    knobs (`--kms`, `--worker-spot`, `--s3-gb`, `--efs-gb`, `--migration-host` as applicable) and paste
@@ -207,7 +237,9 @@ Read `references/terraform-conventions.md` first. Then:
 Read `references/data-migration.md`. Produce `migration/DATA.md` with the exact commands for this app:
 source connection route (SSH tunnel preferred) and where the restore runs from (the optional
 `migration_host`, SSM-only, inside the VPC; the RDS endpoint is private), `pg_migrate.sh preflight
---pg-major-check | dump | roles | restore --target-db <db> --role app_owner | verify`, target DB/role
+--pg-major-check | audit | dump | roles | restore --target-db <db> --role app_owner | verify` (`audit`
+is read-only and lists every role, function, trigger and foreign server the dump would carry; in breach
+mode its signed-off report is required before the final dump), target DB/role
 names, extension list and blockers (TimescaleDB, unsupported versions; PostGIS needs
 `--exclude-table-data spatial_ref_sys`), the minimal-downtime decision (dump/restore under ~10 GB and
 >= 15 min tolerance; native logical replication otherwise, with the `wal_level=logical` + RDS egress
@@ -221,7 +253,10 @@ verification steps. Insist on one rehearsal into a scratch database before cutov
 Fill `references/cutover-runbook-template.md` into `migration/RUNBOOK.md` with this project's names,
 hostnames, webhook/OAuth providers, DNS location and TTL plan, the rehearsal checklist, the minute-by-
 minute cutover sequence, rollback triggers and the data-loss exposure, and the day-1 / day-7 / day-14
-post-cutover tasks (rotation, decommissioning, cost verification). The flip itself is two Terraform
+post-cutover tasks (rotation, decommissioning, cost verification). In breach mode, include the
+template's breach-mode lines (session secrets at the cutover minute, the TCP proxy deleted before the
+first rehearsal and gone by cutover, the Day 1 canary credential, `breach_check.sh --verify` before
+decommissioning) and drop the Day 1-2 rotation items that already happened. The flip itself is two Terraform
 variables in one apply: `traffic_target = "aws"` and `crons_enabled = true`; rollback is the reverse.
 If DNS moves to Route 53, delegation happens at T-7 with `old_platform_records` still pointing at the
 old site. The maintenance switch is cherry-picked onto the OLD deployment alone; the migration branch
@@ -243,8 +278,10 @@ when they have it (plans contain no secret values with this layout).
     inventory/   INVENTORY.md  CODEBASE.md  codebase.json  railway/  vercel/
     .secrets/    (git-ignored; written by scripts only)  aws.<env>.env.template
     PLAN.md      DATA.md      RUNBOOK.md
+    BREACH.md    BREACH-CHECK.md   (breach mode only; fingerprints in .secrets/railway.burned.sha256)
   infra/         bootstrap/  network/  modules/  live/<project>/<env>/  Makefile  .tflint.hcl  ...
   .github/workflows/terraform.yml  deploy.yml
+  .github/dependabot.yml
   Dockerfile  .dockerignore  (+ app code changes on a branch)
 ```
 
@@ -260,11 +297,12 @@ when they have it (plans contain no secret values with this layout).
 | pg_dump/restore, logical replication, roles, Blob/bucket/volume copy, verification | `references/data-migration.md` |
 | OIDC roles, isolation, secret handling, tags/budgets/anomalies, alarms, Organizations | `references/security-and-billing.md` |
 | Runbook skeleton | `references/cutover-runbook-template.md` |
+| Breach mode: fingerprint, BREACH.md, rotation order, session secrets after a leak (only when values were exposed) | `references/breach-response.md` |
 | Terraform roots (`bootstrap`, `network`, `platform` for the shared tier, `live/example-app/prod`) and modules (`alb_https`, `ecs_service`, `rds_postgres`, `valkey`, `secrets`, `scheduled_task`, `s3_media`, `cloudfront_app`, `budget_alerts`, `github_oidc_roles`, `migration_host`), validated on Terraform 1.17 / AWS provider 6.70 | `assets/terraform/` |
 | Dockerfiles (Next.js standalone, Node, Python) and `.dockerignore` | `assets/docker/` |
 | App snippets (health route, next.config, Payload, Better Auth, Stripe route, pg pool, maintenance switch for Next.js and React Router/Remix) | `assets/app-snippets/` |
 | GitHub Actions (plan/apply, build/deploy/migrate) | `assets/github-workflows/` |
-| Scripts (prereqs, inventories, codebase scan, pg migrate + SQL, blob/bucket copy, put_secrets, cost) | `scripts/README.md` |
+| Scripts (prereqs, inventories, breach check, codebase scan, pg migrate + SQL, blob/bucket copy, put_secrets, cost) | `scripts/README.md` |
 
 ## Facts that commonly surprise people (keep them in mind)
 
