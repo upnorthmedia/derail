@@ -43,7 +43,8 @@ or leaked some other way. An ordinary migration never loads this file, and none 
 4. **Prove it**: `scripts/breach_check.sh --project <name> --verify migration/.secrets/railway.burned.sha256`.
    Exit 0 means no variable on Railway still holds an exposed value. Exit 3 means none was found but some
    services could not be read: not a pass, fix the read and re-run. Sealed variables are invisible to the
-   CLI; the user confirms those by hand.
+   CLI, and secrets under 8 characters are not fingerprinted (the checklist and `--verify` name them); the
+   user confirms both by hand.
 5. **Migrate with fresh values.** The AWS env file is filled from the rotated values. `put_secrets.sh`
    finds the fingerprint file next to the env file and refuses any match by key name. Use
    `--allow-carryover KEY` only for a value the user confirms is not a secret.
