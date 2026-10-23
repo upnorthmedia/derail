@@ -19,6 +19,8 @@ PASS=0
 FAIL=0
 ok()   { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
 bad()  { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; }
+# Inside checks, pipe into `grep >/dev/null`, not `grep -q`: -q exits early and, with pipefail,
+# the writer's SIGPIPE turns a match into a random failure.
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
 # ---------------------------------------------------------------- fake railway CLI
@@ -71,12 +73,12 @@ echo "== breach_check.sh"
 
 rc=0; "$SH" "$SCRIPTS/breach_check.sh" --out exposure.md --fingerprint secrets/railway.burned.sha256 >stdout.txt 2>stderr.txt || rc=$?
 check "exits 0" '[ "$rc" -eq 0 ]'
-check "AI key is in group 1" 'awk "/^## 1\\./,/^## 2\\./" exposure.md | grep -q "OPENAI_API_KEY"'
-check "database vars are in group 3" 'awk "/^## 3\\./,/^## 4\\./" exposure.md | grep -q "PGPASSWORD"'
-check "Stripe webhook secret groups with payments" 'awk "/^## 4\\./,/^## 5\\./" exposure.md | grep -q "STRIPE_WEBHOOK_SECRET"'
-check "GitHub token is a deploy token" 'awk "/^## 5\\./,/^## 6\\./" exposure.md | grep -q "GITHUB_TOKEN"'
-check "auth secret is a session secret" 'awk "/^## 6\\./,/^## 8\\./" exposure.md | grep -q "BETTER_AUTH_SECRET"'
-check "reference var points at its source" 'awk "/^## 9\\./,/^## Not covered/" exposure.md | grep -q "DATABASE_URL\` (shop/production/web)"'
+check "AI key is in group 1" 'awk "/^## 1\\./,/^## 2\\./" exposure.md | grep >/dev/null "OPENAI_API_KEY"'
+check "database vars are in group 3" 'awk "/^## 3\\./,/^## 4\\./" exposure.md | grep >/dev/null "PGPASSWORD"'
+check "Stripe webhook secret groups with payments" 'awk "/^## 4\\./,/^## 5\\./" exposure.md | grep >/dev/null "STRIPE_WEBHOOK_SECRET"'
+check "GitHub token is a deploy token" 'awk "/^## 5\\./,/^## 6\\./" exposure.md | grep >/dev/null "GITHUB_TOKEN"'
+check "auth secret is a session secret" 'awk "/^## 6\\./,/^## 8\\./" exposure.md | grep >/dev/null "BETTER_AUTH_SECRET"'
+check "reference var points at its source" 'awk "/^## 9\\./,/^## Not covered/" exposure.md | grep >/dev/null "DATABASE_URL\` (shop/production/web)"'
 check "short config value is left out" '! grep -q "LOG_LEVEL" exposure.md'
 check "short database config (port) is left out" '! grep -q "PGPORT" exposure.md'
 check "public build-time var is left out" '! grep -q "NEXT_PUBLIC_SITE_URL" exposure.md'
@@ -93,11 +95,15 @@ write_web "sk-proj-FIXTUREopenaiROTATED00000002" "FIXTUREpostmark00000000000001"
 "$SH" "$SCRIPTS/breach_check.sh" --out v2.md --verify secrets/railway.burned.sha256 >/dev/null 2>&1 || true
 check "verify drops a rotated key" '! grep -q "web/OPENAI_API_KEY" v2.md && grep -q "web/POSTMARK_SERVER_TOKEN" v2.md'
 
+mkdir -p nested/migration
+rc=0; (cd nested && "$SH" "$SCRIPTS/breach_check.sh" --out migration/BREACH-CHECK.md >../nested.out 2>&1) || rc=$?
+check "--out in a subdirectory works (paths survive the cd into the link dir)" '[ "$rc" -eq 0 ] && grep -q "0 unreadable" nested.out && grep -q "OPENAI_API_KEY" nested/migration/BREACH-CHECK.md'
+
 FAKE_NO_VARIABLE_SUBCMD=1 "$SH" "$SCRIPTS/breach_check.sh" --out fallback.md >/dev/null 2>&1 || true
 check "falls back to \`railway variables\` on older CLIs" 'grep -q "OPENAI_API_KEY" fallback.md'
 
 echo "== railway_inventory.sh (shared classifier)"
-mkdir -p inv && (cd inv && git init -q . && "$SH" "$SCRIPTS/railway_inventory.sh" --project p1 >inv.out 2>&1) || true
+mkdir -p inv && (cd inv && "$SH" "$SCRIPTS/railway_inventory.sh" --project p1 >inv.out 2>&1) || true
 check "classifies with the shared classifier" '[ "$(jq -r ".variables[] | select(.name==\"OPENAI_API_KEY\") | .class" inv/migration/inventory/railway/variables/web.json)" = "app_secret" ]'
 check "references stay references" '[ "$(jq -r ".variables[] | select(.name==\"DATABASE_URL\") | .class" inv/migration/inventory/railway/variables/web.json)" = "reference" ]'
 check "values land only in .secrets" '[ -s inv/migration/.secrets/railway.web.env ] && ! grep -Eqr "$FIXTURE_VALUES" inv/migration/inventory inv/inv.out'
