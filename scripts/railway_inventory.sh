@@ -340,9 +340,16 @@ svcstat_file="$OUT/raw/service-status.json"; is_json "$svcstat_file" || svcstat_
 domains_file="$OUT/raw/domains.json"; is_json "$domains_file" || domains_file=/dev/null
 volumes_file="$OUT/raw/volumes.json"; is_json "$volumes_file" || volumes_file=/dev/null
 buckets_file="$OUT/raw/buckets.json"; is_json "$buckets_file" || buckets_file=/dev/null
+# status.json holds every environment's service instances (4.16.1 always; 5.x without --environment),
+# so keep only the target environment's before merging, or another environment's settings can win.
+# Left whole if the target environment is not in it.
+scope_status_jq='
+  def target: .node.name == $env or .node.id == $env;
+  if (.environments.edges? | type) == "array" and any(.environments.edges[]; target)
+  then .environments.edges |= map(select(target)) else . end'
 
 jq -n \
-  --slurpfile status <(jq -c . "$status_file" 2>/dev/null || echo null) \
+  --slurpfile status <(jq -c --arg env "$ENVIRONMENT" "$scope_status_jq" "$status_file" 2>/dev/null || echo null) \
   --slurpfile envcfg <(jq -c . "$envcfg_file" 2>/dev/null || echo null) \
   --slurpfile svclist <(jq -c . "$svclist_file" 2>/dev/null || echo null) \
   --slurpfile svcstat <(jq -c . "$svcstat_file" 2>/dev/null || echo null) \
