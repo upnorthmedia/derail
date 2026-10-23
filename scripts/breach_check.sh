@@ -70,11 +70,18 @@ command -v railway >/dev/null 2>&1 || { echo "error: railway CLI not found (npm 
 if [ -n "$VERIFY" ] && [ ! -s "$VERIFY" ]; then
   echo "error: --verify file '$VERIFY' is missing or empty" >&2; exit 2
 fi
-if [ -n "$FINGERPRINT" ] && [ -n "$VERIFY" ]; then
-  [ "$FINGERPRINT" != "$VERIFY" ] || { echo "error: --fingerprint and --verify must be different files" >&2; exit 2; }
-fi
 if ! railway whoami >/dev/null 2>&1; then
   echo "error: railway CLI is not logged in (railway login, or set RAILWAY_API_TOKEN)" >&2; exit 1
+fi
+
+# Absolute paths: the Railway CLI runs from a temp link dir, and redirections inside that subshell
+# resolve relative paths against it.
+abspath() { mkdir -p "$(dirname "$1")" && printf '%s/%s\n' "$(cd "$(dirname "$1")" && pwd)" "$(basename "$1")"; }
+OUT="$(abspath "$OUT")"
+[ -n "$FINGERPRINT" ] && FINGERPRINT="$(abspath "$FINGERPRINT")"
+[ -n "$VERIFY" ] && VERIFY="$(abspath "$VERIFY")"
+if [ -n "$FINGERPRINT" ] && [ -n "$VERIFY" ]; then
+  [ "$FINGERPRINT" != "$VERIFY" ] || { echo "error: --fingerprint and --verify must be different files" >&2; exit 2; }
 fi
 
 umask 077
@@ -253,7 +260,7 @@ total="$(awk -F'\t' '$1 > 0 && $1 < 9' "$ROWS" | wc -l | tr -d ' ')"
   for order in 1 2 3 4 5 6 7 8 9; do
     rows="$(awk -F'\t' -v o="$order" '$1 == o' "$ROWS" | sort -t$'\t' -k3,3 -k4,4)"
     [ -n "$rows" ] || continue
-    group="$(printf '%s\n' "$rows" | head -n1 | cut -f2)"
+    group="$(printf '%s\n' "${rows%%$'\n'*}" | cut -f2)"
     echo "## $order. $group"
     echo
     hint "$order"
