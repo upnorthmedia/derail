@@ -956,7 +956,7 @@ def scan(repo: str, vercel_node: Optional[str] = None) -> dict:
             if vm:
                 mismatched = {k: v for k, v in node_versions.items() if (re.search(r"(\d+)", str(v)) or vm).group(1) != vm.group(1)}
                 if mismatched:
-                    flag("warn", "Vercel builds/runs Node %s but %s: align .nvmrc / engines.node and the Dockerfile NODE_VERSION with the version that is known to work (%s.x) before the first ECS build" % (vm.group(1), ", ".join("%s=%s" % kv for kv in mismatched.items()), vm.group(1)))
+                    flag("warn", "Vercel builds/runs Node %s but %s: align .nvmrc / engines.node and the Dockerfile's FROM node:<major>-bookworm-slim@sha256:... line (tag and digest together) with the version that is known to work (%s.x) before the first ECS build" % (vm.group(1), ", ".join("%s=%s" % kv for kv in mismatched.items()), vm.group(1)))
                 else:
                     flag("ok", "Vercel Node %s matches every repo pin; use node:%s-bookworm-slim in the Dockerfile" % (vm.group(1), vm.group(1)))
     elif pkg:
