@@ -53,10 +53,11 @@ WORKDIR /app
 # point at committed files under .yarn/ (yarnPath -> releases, plugins, patch: dependencies -> patches), so those
 # come along; .yarnrc.yml alone breaks a yarnPath setup. mkdir: an app with no dependencies gets no
 # node_modules from npm, and the COPY --from=deps below needs one.
-# Private registry: pass the token as the NPM_TOKEN build secret (`--secret id=NPM_TOKEN,env=NPM_TOKEN`) and
-# reference it as `${NPM_TOKEN}` in .npmrc or `"${NPM_TOKEN:-}"` in .yarnrc.yml. It is only an environment
+# Private registry (npm, Yarn 2+): pass the token as the NPM_TOKEN build secret (`--secret id=NPM_TOKEN,env=NPM_TOKEN`)
+# and reference it as `${NPM_TOKEN}` in .npmrc (npm) or `"${NPM_TOKEN:-}"` in .yarnrc.yml. It is only an environment
 # variable for the install command, never written to a layer. In .yarnrc.yml use `:-`: plain `${NPM_TOKEN}`
-# makes every yarn command in the tools image fail when the variable is unset.
+# makes every yarn command in the tools image fail when the variable is unset. pnpm 10.34.2+/11.5.3+ ignores
+# `${...}` in a project .npmrc's registry and auth settings (https://pnpm.io/npmrc), so this secret does not reach pnpm.
 COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml* package-lock.json* yarn.lock* .npmrc* .yarnrc.yml* ./
 COPY --parents .yarn/releases* .yarn/plugins* .yarn/patches* ./
 RUN --mount=type=secret,id=NPM_TOKEN,env=NPM_TOKEN \
@@ -101,10 +102,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certifi
 COPY --from=builder --chown=node:node /app ./
 ADD --chown=node:node ${RDS_CA_BUNDLE_URL} /app/global-bundle.pem
 USER node
-# Fetch the project's Yarn release now, as the user that runs migrations, so `yarn ...` needs no download at
-# migration time. `corepack install` reads package.json#packageManager; without it, `yarn --version` fetches
-# Corepack's default Yarn.
-RUN if [ -f yarn.lock ]; then corepack install || yarn --version; fi
+# Fetch the project's package manager now, as the user that runs migrations, so `pnpm ...` / `yarn ...` need no
+# download (and no network) at migration time. pnpm: running it once also fetches the native binary that recent
+# pnpm downloads on first use. Yarn: `corepack install` reads package.json#packageManager without starting Yarn
+# (whose .yarnrc.yml may reference an unset variable); without that field, `yarn --version` fetches Corepack's
+# default Yarn.
+RUN if [ -f pnpm-lock.yaml ]; then pnpm --version; \
+    elif [ -f yarn.lock ]; then corepack install || yarn --version; fi
 ENTRYPOINT ["/usr/bin/tini", "--"]
 # Override per project. Payload: ["npx","payload","migrate"]  Drizzle: ["npx","drizzle-kit","migrate"]
 # Prisma: ["npx","prisma","migrate","deploy"]  Better Auth: ["npx","auth@latest","migrate"] (wrap: ["sh","-c","..."])
