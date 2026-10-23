@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034  # rc and SECRETS are read by check() through eval
-# Tests for `pg_migrate.sh audit` against a real throwaway PostgreSQL (no mocks).
+# Tests for `pg_migrate.sh audit` (and restore's EVENT TRIGGER / USER MAPPING handling) against a real
+# throwaway PostgreSQL (no mocks).
 #
 # Starts postgres:17 in Docker on a random localhost port, builds a small app schema, plants what an
 # intruder holding a leaked DATABASE_URL could leave behind (extra login role, SECURITY DEFINER
@@ -23,8 +24,12 @@ ADMIN_URL="${PG_AUDIT_ADMIN_URL:-}"
 cleanup() {
   if [ -n "$CID" ]; then docker rm -f "$CID" >/dev/null 2>&1 || true; fi
   if [ -n "${PG_AUDIT_ADMIN_URL:-}" ]; then
-    psql "$ADMIN_URL" -X -q -c 'DROP DATABASE IF EXISTS pg_audit_test WITH (FORCE)' >/dev/null 2>&1 || true
-    psql "$ADMIN_URL" -X -q -c 'DROP ROLE IF EXISTS intruder' >/dev/null 2>&1 || true
+    for db in pg_audit_test rs_evt rs_um r_evt_role r_evt_keep r_evt_keep_role r_um r_um_keep r_um_fail; do
+      psql "$ADMIN_URL" -X -q -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1 || true
+    done
+    for role in intruder ghost app_owner; do
+      psql "$ADMIN_URL" -X -q -c "DROP ROLE IF EXISTS $role" >/dev/null 2>&1 || true
+    done
   fi
   if [ -n "${KEEP:-}" ]; then echo "kept $T"; else rm -rf "$T"; fi
 }
@@ -171,7 +176,73 @@ check "conninfo quoted password with spaces and an escaped quote" \
 check "conninfo spaces around =" 'm_eq "host=db password = FIXTUREspaced0003 dbname=app" "host=db password=*** dbname=app"'
 check "conninfo unquoted password containing & is masked whole" 'm_eq "password=FIXTUREamp&rest0009 host=db" "password=*** host=db"'
 check "conninfo sslpassword= masked" 'm_eq "sslcert=c.crt sslpassword=FIXTUREsslkey0008 host=db" "sslcert=c.crt sslpassword=*** host=db"'
+check "pg_dump option syntax \"password\" '...' masked" "m_eq \"    \\\"password\\\" 'FIXTUREopt0010''x',\" \"    \\\"password\\\" '***',\""
 check "names that only contain 'password' are left alone" 'm_eq "host=db application_name=passwordless" "host=db application_name=passwordless"'
+
+# ---------------------------------------------------------------- restore: event triggers, user mappings
+# The documented restore is `restore --target-db app --role app_owner` as the admin user. A source event
+# trigger aborts it ("Must be superuser"), and a user mapping either aborts it (its role is missing on the
+# target) or recreates the stored credential there. Both are skipped by default.
+echo "== restore: event triggers"
+url_db() { printf '%s' "$ADMIN_URL" | sed -E "s#^([a-z]+://[^/]*)/[^?]*#\1/$1#"; }
+psql "$ADMIN_URL" -X -q -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+SET client_min_messages TO error;
+CREATE ROLE app_owner NOLOGIN;
+GRANT app_owner TO CURRENT_USER;
+CREATE ROLE ghost NOLOGIN;
+CREATE DATABASE rs_evt;
+CREATE DATABASE rs_um;
+SQL
+psql "$(url_db rs_evt)" -X -q -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE TABLE public.items (id bigserial PRIMARY KEY, name text);
+INSERT INTO public.items (name) VALUES ('a'), ('b');
+CREATE FUNCTION public.on_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$;
+CREATE EVENT TRIGGER watch_ddl ON ddl_command_start EXECUTE FUNCTION public.on_ddl();
+SQL
+psql "$(url_db rs_um)" -X -q -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE TABLE public.items (id bigserial PRIMARY KEY, name text);
+CREATE EXTENSION postgres_fdw;
+CREATE SERVER other_srv FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host 'other.invalid', dbname 'x');
+CREATE USER MAPPING FOR PUBLIC SERVER other_srv OPTIONS (user 'x', password 'FIXTUREumpass0002');
+CREATE USER MAPPING FOR ghost SERVER other_srv OPTIONS (user 'y', password 'FIXTUREumpass0003');
+SQL
+evt_count() { psql "$(url_db "$1")" -X -q -At -c 'SELECT count(*) FROM pg_event_trigger' 2>/dev/null || echo "?"; }
+um_count() { psql "$(url_db "$1")" -X -q -At -c 'SELECT count(*) FROM pg_user_mappings' 2>/dev/null || echo "?"; }
+mig() { env SRC_URL="$(url_db "$1")" TGT_URL="$ADMIN_URL" "$SH" "$SCRIPTS/pg_migrate.sh" "${@:2}"; }
+
+rc=0; mig rs_evt dump --out d_evt >r0.txt 2>&1 || rc=$?
+check "dump without --exclude-table-data exits 0" '[ "$rc" -eq 0 ]'
+rc=0; mig rs_evt restore --out d_evt --target-db r_evt_role --role app_owner >r1.txt 2>&1 || rc=$?
+check "restore --role app_owner exits 0 when the source has an event trigger" '[ "$rc" -eq 0 ]'
+check "restore names the skipped event trigger in a NOTE" 'grep "NOTE" r1.txt | grep >/dev/null "watch_ddl"'
+check "no event trigger on the target by default" '[ "$(evt_count r_evt_role)" = "0" ]'
+check "restore still verifies OK" 'grep >/dev/null "VERIFY: OK" r1.txt'
+rc=0; mig rs_evt restore --out d_evt --target-db r_evt_keep --keep-event-triggers >r2.txt 2>&1 || rc=$?
+check "--keep-event-triggers without --role exits 0" '[ "$rc" -eq 0 ]'
+check "--keep-event-triggers recreates the event trigger" '[ "$(evt_count r_evt_keep)" = "1" ]'
+check "--keep-event-triggers warns about RDS major version upgrades" 'grep "WARN" r2.txt | grep >/dev/null "major version upgrade"'
+rc=0; mig rs_evt restore --out d_evt --target-db r_evt_keep_role --keep-event-triggers --role app_owner >r3.txt 2>&1 || rc=$?
+check "--keep-event-triggers with --role warns that it needs restore without --role" 'grep "WARN" r3.txt | grep >/dev/null "without --role"'
+
+echo "== restore: user mappings"
+rc=0; mig rs_um dump --out d_um1 >r4.txt 2>&1 || rc=$?
+check "dump with user mappings exits 0" '[ "$rc" -eq 0 ]'
+# the target cluster has no `ghost` role (as on a fresh RDS instance)
+psql "$(url_db rs_um)" -X -q -v ON_ERROR_STOP=1 -c 'DROP USER MAPPING FOR ghost SERVER other_srv' >/dev/null
+psql "$ADMIN_URL" -X -q -v ON_ERROR_STOP=1 -c 'DROP ROLE ghost' >/dev/null
+rc=0; mig rs_um restore --out d_um1 --target-db r_um >r5.txt 2>&1 || rc=$?
+check "restore exits 0 when a mapping's role is missing on the target" '[ "$rc" -eq 0 ]'
+check "restore names the skipped user mappings in a NOTE" 'grep "NOTE" r5.txt | grep "ghost" | grep >/dev/null "public"'
+check "no user mapping (and no stored credential) on the target by default" '[ "$(um_count r_um)" = "0" ]'
+rc=0; mig rs_um dump --out d_um2 >r6.txt 2>&1 || rc=$?
+rc=0; mig rs_um restore --out d_um2 --target-db r_um_keep --keep-user-mappings >r7.txt 2>&1 || rc=$?
+check "--keep-user-mappings exits 0 when every mapping's role exists" '[ "$rc" -eq 0 ]'
+check "--keep-user-mappings recreates the mapping" '[ "$(um_count r_um_keep)" = "1" ]'
+check "--keep-user-mappings warns that stored credentials are recreated" 'grep "WARN" r7.txt | grep >/dev/null "credential"'
+rc=0; mig rs_um restore --out d_um1 --target-db r_um_fail --keep-user-mappings >r8.txt 2>&1 || rc=$?
+check "--keep-user-mappings with a mapping for a missing role fails (exit 1)" '[ "$rc" -eq 1 ]'
+check "the failed restore's error output does not print the mapping password" '! grep "FIXTUREumpass" r8.txt >/dev/null'
+check "no mapping password in restore output" '! cat r4.txt r5.txt r6.txt r7.txt | grep "FIXTUREumpass" >/dev/null'
 
 echo
 echo "passed: $PASS  failed: $FAIL"

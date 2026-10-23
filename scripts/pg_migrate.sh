@@ -12,7 +12,8 @@
 #   preflight  versions, size, extensions (and availability on target), tables without PK, roles
 #   dump       pg_dump -Fd -jN --compress=zstd --no-owner --no-privileges ... + counts/checksums
 #   restore    create DB + extensions, pg_restore -jN --no-owner --no-privileges --no-comments
-#              [--role], ANALYZE, counts/checksums diff -> OK / MISMATCH
+#              [--role], ANALYZE, counts/checksums diff -> OK / MISMATCH. Skips the dump's event
+#              triggers and user mappings unless --keep-event-triggers / --keep-user-mappings
 #   verify     re-run counts/checksums on both sides and diff
 #   roles      render sql/app_roles.sql.tpl and apply (passwords via APP_RW_PASSWORD /
 #              APP_MIGRATE_PASSWORD env, read inside psql with \getenv; never echoed)
@@ -38,6 +39,8 @@ APP_MIGRATE="app_migrate"
 EXIT_ON_ERROR=1
 CLEAN=0
 PG_MAJOR_CHECK=0
+KEEP_EVENT_TRIGGERS=0
+KEEP_USER_MAPPINGS=0
 EXCLUDE_TABLE_DATA=()
 
 usage() {
@@ -54,6 +57,12 @@ Options:
   --dump-dir DIR     dump directory for restore/verify (default: <out>/LATEST pointer)
   --clean            restore with --clean --if-exists (re-runnable into a scratch DB)
   --no-exit-on-error restore without --exit-on-error (tolerate benign RDS errors)
+  --keep-event-triggers  restore: also restore the dump's event triggers (skipped by default and named in
+                     a NOTE). CREATE EVENT TRIGGER needs superuser (RDS: the main user), so use it without
+                     --role; RDS requires event triggers to be dropped before a major version upgrade.
+  --keep-user-mappings   restore: also restore the dump's foreign-server user mappings (skipped by default
+                     and named in a NOTE). Each one recreates a stored credential for another server, and
+                     one whose role does not exist on the target aborts the restore.
   --exclude-table-data PATTERN   dump: pass through to pg_dump --exclude-table-data (schema kept, rows
                      skipped). Repeatable. Typical: --exclude-table-data='spatial_ref_sys' (PostGIS
                      populates it from the extension; restoring the rows conflicts), session/log/cache tables.
@@ -92,6 +101,8 @@ while [ $# -gt 0 ]; do
     --exclude-table-data) EXCLUDE_TABLE_DATA+=("${2:-}"); shift 2 ;;
     --exclude-table-data=*) EXCLUDE_TABLE_DATA+=("${1#*=}"); shift ;;
     --pg-major-check) PG_MAJOR_CHECK=1; shift ;;
+    --keep-event-triggers) KEEP_EVENT_TRIGGERS=1; shift ;;
+    --keep-user-mappings) KEEP_USER_MAPPINGS=1; shift ;;
     --app-owner) APP_OWNER="${2:-}"; shift 2 ;;
     --app-rw) APP_RW="${2:-}"; shift 2 ;;
     --app-migrate) APP_MIGRATE="${2:-}"; shift 2 ;;
@@ -130,8 +141,9 @@ export PGOPTIONS="${PGOPTIONS:-} -c statement_timeout=0"
 
 # mask secrets in connection strings: user:password@ in URLs; password= / sslpassword= as a URL query
 # parameter (value ends at & or whitespace); and in key=value conninfo (value ends at whitespace, or is
-# single-quoted with \' escapes; spaces around = allowed)
-mask_stream() { sed -E -e 's#(://[^:/@]*):[^@]*@#\1:***@#g' -e 's#([?&])(ssl)?password=[^&[:space:]]*#\1\2password=***#g' -e 's#(^|[[:space:]])(ssl)?password[[:space:]]*=[[:space:]]*('"'"'([^'"'"'\\]|\\.)*'"'"'|[^[:space:]]*)#\1\2password=***#g'; }
+# single-quoted with \' escapes; spaces around = allowed); and pg_dump's option syntax
+# ("password" '...', as in a CREATE USER MAPPING echoed by a failed pg_restore)
+mask_stream() { sed -E -e 's#(://[^:/@]*):[^@]*@#\1:***@#g' -e 's#([?&])(ssl)?password=[^&[:space:]]*#\1\2password=***#g' -e 's#(^|[[:space:]])(ssl)?password[[:space:]]*=[[:space:]]*('"'"'([^'"'"'\\]|\\.)*'"'"'|[^[:space:]]*)#\1\2password=***#g' -e 's#("(ssl)?password"[[:space:]]+)'"'"'([^'"'"']|'"'"''"'"')*'"'"'#\1'"'"'***'"'"'#g'; }
 mask() { printf '%s' "$1" | mask_stream; }
 # db name from a URL path (postgresql://.../NAME?x=y)
 url_db() { printf '%s' "$1" | sed -nE 's#^[a-z]+://[^/]*/([^?]*).*$#\1#p'; }
@@ -269,7 +281,7 @@ do_dump() {
     --no-subscriptions --no-publications \
     --quote-all-identifiers \
     --exclude-schema=pgbouncer \
-    "${excl[@]}" \
+    ${excl[@]+"${excl[@]}"} \
     --file="$dir/data"
   if [ "$DRY_RUN" -eq 0 ]; then
     excl_json="$(printf '%s\n' "${EXCLUDE_TABLE_DATA[@]:-}" | grep -v '^$' | sed 's/"/\\"/g; s/^/"/; s/$/"/' | paste -sd, - || true)"
@@ -278,6 +290,13 @@ do_dump() {
     log "dump complete: $dir  ($(du -sh "$dir/data" 2>/dev/null | cut -f1))"
     log "NOTE: anything committed on the source after the dump started is not included. Stop writes before the final dump."
   fi
+}
+
+# toc_names <toc-file> <KIND>: comma-separated names of the TOC entries of one kind ("EVENT TRIGGER",
+# "USER MAPPING"); a TOC line is "<id>; <catalog> <oid> <KIND> - <name> <owner>"
+toc_names() {
+  { grep -E "^[0-9]+; [0-9]+ [0-9]+ $2 - " "$1" || true; } \
+    | sed -E "s/^[0-9]+; [0-9]+ [0-9]+ $2 - ($2 )?(.*) [^ ]*\$/\2/" | paste -sd, - | sed 's/,/, /g'
 }
 
 resolve_dump_dir() {
@@ -341,11 +360,23 @@ do_restore() {
   fi
 
   # 3. TOC filter: skip SCHEMA/EXTENSION entries we pre-created above (otherwise pg_restore fails
-  #    with "already exists" under --exit-on-error). Everything else is restored.
+  #    with "already exists" under --exit-on-error). Also skip, unless asked for, EVENT TRIGGER entries
+  #    (need superuser, so they abort a --role restore; RDS needs them dropped before a major version
+  #    upgrade) and USER MAPPING entries (each recreates another server's stored credential, and aborts
+  #    the restore when its role is missing on the target). Everything else is restored.
   local args=(--dbname="$APP_URL" --jobs="$JOBS" --no-owner --no-privileges --no-comments --verbose)
   [ -n "$ROLE" ] && args+=(--role="$ROLE")
   [ "$CLEAN" -eq 1 ] && args+=(--clean --if-exists)
   [ "$EXIT_ON_ERROR" -eq 1 ] && args+=(--exit-on-error)
+  if [ "$KEEP_EVENT_TRIGGERS" -eq 1 ]; then
+    log "WARN: --keep-event-triggers: RDS requires event triggers to be dropped before a major version upgrade,"
+    log "      and CREATE EVENT TRIGGER needs superuser (RDS: the main user), so run restore without --role."
+    [ -n "$ROLE" ] && log "WARN: --keep-event-triggers with --role $ROLE: any event trigger in the dump will fail (\"must be superuser\"); run restore without --role."
+  fi
+  if [ "$KEEP_USER_MAPPINGS" -eq 1 ]; then
+    log "WARN: --keep-user-mappings: each mapping recreates a stored credential for another server on the target,"
+    log "      and a mapping whose role does not exist on the target aborts the restore."
+  fi
   if [ "$DRY_RUN" -eq 0 ]; then
     local toc="$OUT/toc-$STAMP.list"
     pg_restore -l "$DUMP_DIR/data" >"$toc"
@@ -358,7 +389,34 @@ do_restore() {
     fi
     grep -Ev "$skip_re" "$toc" >"$toc.filtered" || true
     log "TOC: $(grep -c '^[0-9]' "$toc") entries, $(( $(grep -c '^[0-9]' "$toc") - $(grep -c '^[0-9]' "$toc.filtered") )) pre-created entries skipped"
+    local n_evt n_um drop_re='^$'
+    n_evt="$(grep -cE '^[0-9]+; [0-9]+ [0-9]+ EVENT TRIGGER - ' "$toc" || true)"
+    n_um="$(grep -cE '^[0-9]+; [0-9]+ [0-9]+ USER MAPPING - ' "$toc" || true)"
+    if [ "$n_evt" -gt 0 ]; then
+      if [ "$KEEP_EVENT_TRIGGERS" -eq 1 ]; then
+        log "keeping $n_evt event trigger(s) (--keep-event-triggers): $(toc_names "$toc" 'EVENT TRIGGER')"
+      else
+        drop_re="$drop_re|^[0-9]+; [0-9]+ [0-9]+ EVENT TRIGGER - "
+        log "NOTE: skipped $n_evt event trigger(s) from the dump: $(toc_names "$toc" 'EVENT TRIGGER')."
+        log "      Check them against the db-audit report (section 6). --keep-event-triggers restores them (without --role)."
+      fi
+    fi
+    if [ "$n_um" -gt 0 ]; then
+      if [ "$KEEP_USER_MAPPINGS" -eq 1 ]; then
+        log "keeping $n_um user mapping(s) (--keep-user-mappings): $(toc_names "$toc" 'USER MAPPING')"
+      else
+        drop_re="$drop_re|^[0-9]+; [0-9]+ [0-9]+ USER MAPPING - "
+        log "NOTE: skipped $n_um user mapping(s) from the dump: $(toc_names "$toc" 'USER MAPPING')."
+        log "      Each stores a credential for another server (treat it as exposed). --keep-user-mappings restores them."
+      fi
+    fi
+    if [ "$drop_re" != '^$' ]; then
+      grep -Ev "$drop_re" "$toc.filtered" >"$toc.filtered.tmp" || true
+      mv "$toc.filtered.tmp" "$toc.filtered"
+    fi
     args+=(--use-list="$toc.filtered")
+  else
+    echo "  (would skip EVENT TRIGGER / USER MAPPING entries in the dump unless --keep-event-triggers / --keep-user-mappings)"
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
     run_cmd pg_restore "${args[@]}" --use-list="$OUT/toc-<stamp>.list.filtered" "$DUMP_DIR/data"
@@ -491,6 +549,8 @@ do_audit() {
 publications and subscriptions are not copied. Everything else listed above that lives in this
 database is: functions, triggers, event triggers, rules, schemas, extensions, foreign servers and
 user mappings (a user mapping's options, including any password, are written to the dump in plain text).
+`restore` then skips event triggers and user mappings unless given --keep-event-triggers /
+--keep-user-mappings; everything else is recreated on the target.
 
 - [ ] 1-2. Every role is known and has a purpose; no unexpected login, superuser, createrole,
       bypassrls or replication attribute, valid_until or membership (e.g. pg_read_server_files,
