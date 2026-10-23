@@ -107,6 +107,9 @@ group_jq="$classify_jq"'
       | if ($c == "railway_injected") and (($k | test("^RAILWAY_(API_)?TOKEN$")) | not) then empty
         elif ($c | IN("build_tuning", "public_buildtime", "empty")) then empty
         elif $c == "reference" then [9, "References (rotate the source variable, not these)", $k]
+        elif ($k | test("(_REGION|_BUCKET|_BUCKET_NAME|_HOST|_HOSTNAME|_PORT|_USER|_USERNAME|_DATABASE|_DB|_CLIENT_ID|_APP_ID|_PROJECT_ID|_ORG_ID|_ENV|^PGUSER|^PGDATABASE|^PGHOST|^PGPORT|^NODE_ENV|^LOG_LEVEL)$"))
+             or (($k | test("_URL$")) and (($k | test("WEBHOOK|HOOK")) | not) and ($v | test("^https?://[^@?#]+$")))
+          then [0, "config", $k]
         elif ($v | length) < 8 and (($k | test("KEY|SECRET|TOKEN|PASS|DSN|CREDENTIAL|PRIVATE|AUTH|SIGN|SALT|_URL$|_URI$")) | not) then [0, "config", $k]
         elif ($k | test("^(OPENAI|ANTHROPIC|CLAUDE|GROQ|MISTRAL|GEMINI|GOOGLE_GENERATIVE_AI|GOOGLE_AI|COHERE|REPLICATE|TOGETHER|OPENROUTER|HUGGINGFACE|HF|DEEPSEEK|XAI|FIREWORKS|PERPLEXITY|AZURE_OPENAI|VOYAGE|ELEVENLABS|FAL|DEEPGRAM|ASSEMBLYAI|CEREBRAS|LANGSMITH|LANGCHAIN|PINECONE)_")) then [1, "AI provider keys", $k]
         elif $c == "bucket_credential" or ($k | test("^(AWS_|GCP_|GCLOUD_|GOOGLE_APPLICATION_CREDENTIALS|GOOGLE_CLOUD_|GOOGLE_SERVICE_ACCOUNT|AZURE_|CLOUDFLARE_|CF_API|R2_|DIGITALOCEAN_|DO_)")) then [2, "Cloud credentials", $k]
@@ -118,12 +121,10 @@ group_jq="$classify_jq"'
         else [8, "Other third-party keys and secrets (review)", $k] end)
   | .[] | @tsv'
 
-# exportable values only: what put_secrets.sh could ever be handed
+# Fingerprint exactly what the checklist lists (groups 1-8): config and references are not secrets,
+# and fingerprinting them would make put_secrets.sh refuse an unchanged bucket name.
 fp_select_jq="$classify_jq"'
-  | map(. as $e | classify($e.key; $e.value) as $c
-      | select(($c | IN("railway_injected", "build_tuning", "public_buildtime", "empty", "reference") | not)
-               or ($e.key | test("^RAILWAY_(API_)?TOKEN$"))))
-  | from_entries'
+  | map(select(.key as $k | $keys | index($k))) | from_entries'
 
 # ---------------------------------------------------------------- projects
 if ! railway list --json >"$TMP/projects.json" 2>>"$ERRLOG" || ! jq -e 'type == "array"' "$TMP/projects.json" >/dev/null 2>&1; then
@@ -183,12 +184,14 @@ while IFS=$'\t' read -r pid pname ename sname; do
     FAILED=$((FAILED + 1)); rm -f "$raw"; continue
   fi
 
-  jq -r "$group_jq" "$raw" | while IFS=$'\t' read -r order group key; do
+  jq -r "$group_jq" "$raw" >"$TMP/svc.rows"
+  while IFS=$'\t' read -r order group key; do
     printf '%s\t%s\t%s\t%s\n' "$order" "$group" "$key" "$loc"
-  done >>"$ROWS"
+  done <"$TMP/svc.rows" >>"$ROWS"
 
   if [ -n "$FINGERPRINT" ] || [ -n "$VERIFY" ]; then
-    jq "$fp_select_jq" "$raw" >"$TMP/vars.export.json"
+    keys_json="$(awk -F'\t' '$1 >= 1 && $1 <= 8 { print $3 }' "$TMP/svc.rows" | jq -R . | jq -s -c .)"
+    jq --argjson keys "$keys_json" "$fp_select_jq" "$raw" >"$TMP/vars.export.json"
     fp_entries "$TMP/vars.export.json" | while IFS=$'\t' read -r key fp; do
       printf '%s\t%s/%s\n' "$fp" "$loc" "$key"
     done >>"$FP_NEW"
