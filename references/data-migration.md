@@ -67,8 +67,15 @@ when the service has no proxy. If a dump cannot use the tunnel, or you run logic
 3), re-create the proxy for that window only (`railway tcp-proxy create --port 5432 --service <postgres>`;
 read the new domain and port from `tcp-proxy list`) and delete it when the window closes.
 
+`restore` skips the dump's event triggers and foreign-server user mappings by default and names them in a
+NOTE: an event trigger needs superuser (it aborts the `--role app_owner` restore, and RDS needs it dropped
+before a major version upgrade) and a user mapping carries another server's credential; pass
+`--keep-event-triggers` (without `--role`) or `--keep-user-mappings` only for ones the db-audit report
+shows are yours.
+
 `dump` uses `--no-owner --no-privileges`, which drops ownership but not the objects themselves: every
-function, trigger, event trigger, rule and foreign server in the source is restored. `audit` lists them so a
+function, trigger, rule and foreign server in the source is restored (event triggers and user mappings only
+with the `--keep-*` flags above). `audit` lists them so a
 person can confirm each is the app's own; in breach mode the signed-off report is required before the final dump.
 
 Flag rationale: directory format is the only one that supports parallel `--jobs`; `--no-owner
