@@ -244,6 +244,16 @@ check "--keep-user-mappings with a mapping for a missing role fails (exit 1)" '[
 check "the failed restore's error output does not print the mapping password" '! grep "FIXTUREumpass" r8.txt >/dev/null'
 check "no mapping password in restore output" '! cat r4.txt r5.txt r6.txt r7.txt | grep "FIXTUREumpass" >/dev/null'
 
+# Reports, logs and dumps can hold credentials (a failed restore's log echoes the failing CREATE USER
+# MAPPING with its password), so everything written into --out is private to the user.
+echo "== file modes in --out"
+rc=0; mig rs_evt preflight --out p_out >r9.txt 2>&1 || rc=$?
+check "preflight exits 0" '[ "$rc" -eq 0 ]'
+check "the failed restore wrote its log" 'ls d_um1/restore-*.log >/dev/null 2>&1'
+loose="$(find out out5 p_out d_evt d_um1 d_um2 \( -type f ! -perm 600 \) -o \( -type d ! -perm 700 \) 2>/dev/null || true)"
+check "every file in --out is mode 600 and every directory 700 (reports, logs, TOC lists, dumps)" '[ -z "$loose" ]'
+[ -z "$loose" ] || printf '%s\n' "$loose" | head -n 5 | sed 's/^/        /'
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
