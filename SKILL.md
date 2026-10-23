@@ -197,6 +197,10 @@ Read `references/terraform-conventions.md` first. Then:
    line; to change the Node/Python version, change the tag and the digest together
    (`docker buildx imagetools inspect <image:tag>`). Copy `assets/github/dependabot.yml` to
    `.github/dependabot.yml` so the digest pins and the workflow actions get weekly update PRs.
+   Private npm registry (`.npmrc` / `.yarnrc.yml` with a token): set the repository secret
+   `DOCKER_BUILD_SECRET_NPM_TOKEN` and reference it as `${NPM_TOKEN}` (.npmrc) or `"${NPM_TOKEN:-}"`
+   (.yarnrc.yml); never commit or bake the token. In breach mode, rotate that token first if it was a
+   Railway variable.
    The Node/Next.js files have two targets: `runner` (what the service runs) and
    `tools` (full dependencies for migrations, built as `<sha>-tools`); the migration task uses the tools
    image because the standalone runner cannot run `payload migrate`, `drizzle-kit`, `prisma` or
