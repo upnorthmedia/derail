@@ -1,0 +1,16 @@
+schema_version: "1.1"
+name: railway-breach-nextjs-ai
+expected_outcome: |
+  Breach mode, end to end, for an all-Railway Next.js 16 AI app whose values were on Railway during the
+  2026-10-21 environment-variable breach. The skill asks nothing it was already told, writes
+  migration/BREACH.md (names only) that keeps the user's breach_check.sh order, marks the two rotated AI
+  keys done and every other exposed credential (database password, AWS keys, Stripe, GitHub OAuth secret,
+  the sealed RESEND_API_KEY, the RAILWAY_TOKEN in GitHub secrets) as rotate-now before migration work,
+  and replaces the usual "keep BETTER_AUTH_SECRET identical through cutover" with rotation at the
+  cutover minute (sessions deleted, the leaked value not left valid). The secrets template asks for new
+  provider values, put_secrets.sh runs with the fingerprint file in place, the runbook gates cutover and
+  decommissioning on breach_check.sh --verify, and PLAN.md opens with a keyless scorecard (static AWS keys
+  -> task role, RAILWAY_TOKEN -> GitHub OIDC). Ordinary package otherwise: validated Terraform, cost
+  against ~$63/month, nothing applied, no values anywhere.
+context:
+  scaffold_script: place-files.sh
