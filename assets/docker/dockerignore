@@ -18,3 +18,8 @@ infra/**/*.tfstate*
 Dockerfile*
 docker-compose*.yml
 README.md
+# Yarn 2+ local install state and cache (the image runs its own install)
+.yarn/cache
+.yarn/unplugged
+.yarn/install-state.gz
+.pnp.*

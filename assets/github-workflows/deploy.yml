@@ -34,9 +34,11 @@
 #   TF_VERSION             default 1.17.0;       TF_ENVIRONMENT  GitHub Environment for the apply job, default "prod"
 #                          (must match the root's github_environment variable: it is part of the OIDC subject)
 #   BUILD_RUNNER           runner label for the build job, default ubuntu-latest (ubuntu-24.04-arm builds natively)
-# Optional repository secret:
+# Optional repository secrets:
 #   DOCKER_BUILD_SECRET_DATABASE_URL   BuildKit secret `DATABASE_URL` for builds that touch the DB (Payload).
 #                                      Mounted only during RUN --mount=type=secret; never in a layer or a log.
+#   DOCKER_BUILD_SECRET_NPM_TOKEN      BuildKit secret `NPM_TOKEN` for private npm registries: referenced as
+#                                      ${NPM_TOKEN} in .npmrc or "${NPM_TOKEN:-}" in .yarnrc.yml (Node Dockerfiles).
 #
 # Terraform outputs this workflow reads (the root in assets/terraform/live/<project>/<env> provides them):
 #   image_tag, ecr_repository_url, ecs_cluster_name, ecs_service_name, migration_task_family,
@@ -202,6 +204,7 @@ jobs:
           # Empty when the repository secret is not set; the Dockerfile tolerates a missing secret.
           secrets: |
             DATABASE_URL=${{ secrets.DOCKER_BUILD_SECRET_DATABASE_URL }}
+            NPM_TOKEN=${{ secrets.DOCKER_BUILD_SECRET_NPM_TOKEN }}
           cache-from: type=gha,scope=${{ vars.TF_ROOT }}
           cache-to: type=gha,mode=max,scope=${{ vars.TF_ROOT }}
 
@@ -222,6 +225,7 @@ jobs:
             ${{ vars.DOCKER_BUILD_ARGS }}
           secrets: |
             DATABASE_URL=${{ secrets.DOCKER_BUILD_SECRET_DATABASE_URL }}
+            NPM_TOKEN=${{ secrets.DOCKER_BUILD_SECRET_NPM_TOKEN }}
           cache-from: type=gha,scope=${{ vars.TF_ROOT }}
           cache-to: type=gha,mode=max,scope=${{ vars.TF_ROOT }}
 
