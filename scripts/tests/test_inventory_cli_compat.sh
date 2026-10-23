@@ -97,10 +97,14 @@ list_vars() {
 case "${1:-} ${2:-}" in
   "whoami "*) echo "Logged in as Test" ;;
   "link "*) : ;;
-  "status --json") echo '{"name":"shop","services":{"edges":[{"node":{"name":"web"}}]}}' ;;
+  "status --json") if [ "$FAKE_CLI" = new ]; then cat "$D/status-5.json"; else cat "$D/status.json"; fi ;;
   "service list")
     if [ "$FAKE_CLI" = old ]; then echo "fake 4.16.1: would link a service named 'list'" >&2; exit 1; fi
-    echo '[{"name":"web"}]' ;;
+    cat "$D/service-list.json" ;;
+  "service status")
+    # legacy ServiceStatusOutput, same on 4.16.1 and 5.71.0 (src/commands/service.rs)
+    if [ "$FAKE_CLI" = new ]; then echo "Warning: \`railway service status --all\` is deprecated. Please use \`railway service list\` instead." >&2; fi
+    echo '[{"id":"s1","name":"web","deploymentId":null,"status":null,"stopped":false}]' ;;
   "variable list")
     if [ "$FAKE_CLI" = old ]; then
       printf "error: unrecognized subcommand 'variable'\n\n  tip: a similar subcommand exists: 'variables'\n" >&2; exit 2
@@ -121,6 +125,45 @@ cat >"$T/fixture/vars/web.json" <<'EOF'
  "LOG_LEVEL":"info","RAILWAY_PUBLIC_DOMAIN":"web-production.up.railway.app"}
 EOF
 FIXTURE_VALUES="FIXTURE|sk-proj-"
+
+# `railway status --json` prints the `Project` GraphQL result as JSON (railwayapp/cli v4.16.1:
+# src/commands/status.rs, src/gql/queries/strings/Project.graphql; 5.71.0 adds instance fields).
+# `services` is project-wide; the services of one environment are its serviceInstances. `worker`
+# exists only in staging, so a production inventory must not pick it up.
+cat >"$T/fixture/status.json" <<'EOF'
+{"id":"p1","name":"shop","deletedAt":null,"workspace":{"name":"Acme"},
+ "environments":{"edges":[
+  {"node":{"id":"e1","name":"production","canAccess":true,"deletedAt":null,
+   "serviceInstances":{"edges":[{"node":{"id":"si1","serviceId":"s1","serviceName":"web","environmentId":"e1",
+     "latestDeployment":null,"source":{"repo":"acme/web","image":null},
+     "domains":{"serviceDomains":[{"id":"d1","domain":"web-production.up.railway.app","targetPort":8080}],"customDomains":[]},
+     "cronSchedule":null,"nextCronRunAt":null,"startCommand":"node server.js"}}]},
+   "volumeInstances":{"edges":[]}}},
+  {"node":{"id":"e2","name":"staging","canAccess":true,"deletedAt":null,
+   "serviceInstances":{"edges":[
+     {"node":{"id":"si2","serviceId":"s1","serviceName":"web","environmentId":"e2","latestDeployment":null,
+       "source":{"repo":"acme/web","image":null},"domains":{"serviceDomains":[],"customDomains":[]},
+       "cronSchedule":null,"nextCronRunAt":null,"startCommand":"node server.js"}},
+     {"node":{"id":"si3","serviceId":"s2","serviceName":"worker","environmentId":"e2","latestDeployment":null,
+       "source":{"repo":"acme/worker","image":null},"domains":{"serviceDomains":[],"customDomains":[]},
+       "cronSchedule":"*/5 * * * *","nextCronRunAt":null,"startCommand":null}}]},
+   "volumeInstances":{"edges":[]}}}]},
+ "services":{"edges":[{"node":{"id":"s1","name":"web"}},{"node":{"id":"s2","name":"worker"}}]}}
+EOF
+# 5.71.0 adds the environment instances (src/commands/status.rs, EnvironmentInstances.graphql), including
+# the legacy numReplicas that reports 1 for multi-region services.
+jq '(.environments.edges[].node.serviceInstances.edges[].node) += {numReplicas: 1}' \
+  "$T/fixture/status.json" >"$T/fixture/status-5.json"
+# `railway service list --json` on 5.x: one ServiceOutput per service in the environment
+# (railwayapp/cli v5.71.0: src/commands/output/service_summary.rs).
+cat >"$T/fixture/service-list.json" <<'EOF'
+[{"id":"s1","name":"web","isLinked":false,"source":{"repo":"acme/web","image":null},"status":"SUCCESS",
+  "deploymentStopped":false,"deploymentId":"dep1",
+  "latestDeployment":{"id":"dep1","status":"SUCCESS","createdAt":"2026-10-20T12:00:00Z","deploymentStopped":false},
+  "url":"https://web-production.up.railway.app","volumes":[],
+  "regions":[{"name":"us-west2","location":"California, USA","configured":2}],
+  "replicas":{"configured":2,"running":2,"crashed":0,"exited":0,"total":2},"volumeMigrating":false}]
+EOF
 
 # inventory <dir> [ENV=VALUE ...]   runs railway_inventory.sh in a new <dir> (each name used once)
 inventory() {
@@ -165,18 +208,30 @@ check "skips are logged in errors.log" 'grep -x "## \[domain list --json\] skipp
 check "help is read once per command" '[ "$(grep -cx -- "--help" $L)" = 1 ] && [ "$(grep -cx "service --help" $L)" = 1 ] && [ "$(grep -cx "domain --help" $L)" = 1 ]'
 check "skips are not counted as command errors" 'grep "skipped (not in this CLI)=" guard_old/inv.out >/dev/null'
 check "services are still found (from status --json)" 'grep -x web guard_old/$INV/services.txt >/dev/null'
+check "only services of the target environment (not staging-only ones)" '[ "$(cat guard_old/$INV/services.txt)" = "web" ]'
 check "variables are still exported" '[ "$(jq -r .count guard_old/$INV/variables/web.json 2>/dev/null)" = "4" ]'
 
 echo "== subcommand guard, new CLI (5.x): runs them"
 inventory guard_new FAKE_CLI=new
 E=guard_new/$INV/errors.log
-for c in "domain list --json" "domain list -s web --json" "service list --json" "service status --all --json" \
+for c in "domain list --json" "domain list -s web --json" "service list --json" \
          "environment config --json" "environment list" "volume list --json" "bucket list --json" "cron list" \
          "functions list" "config pull --force" "postgres ha status --json" "postgres pgbouncer status --json" \
          "postgres pitr status --json" "usage projects --project shop --json"; do
   check "runs \`$c\`" 'grep -x -- "$c" $L >/dev/null'
 done
 check "nothing skipped" '! grep "skipped: not in this CLI" $E >/dev/null'
+check "no deprecated \`service status --all\` call (\`service list --json\` has its data)" '! grep -E "^service status" $L >/dev/null'
+check "summary uses \`service list --json\` (regions)" 'jq -e ".services[] | select(.name==\"web\") | .regions | tostring | test(\"us-west2\")" guard_new/$INV/services.normalized.json >/dev/null'
+check "summary uses \`service list --json\` (replicas, not legacy numReplicas)" 'jq -e ".services[] | select(.name==\"web\") | .replicas.configured == 2" guard_new/$INV/services.normalized.json >/dev/null 2>&1'
+
+echo "== re-run with an older CLI in the same directory"
+mkdir rerun
+(cd rerun && env FAKE_CLI=new "$SH" "$SCRIPTS/railway_inventory.sh" --project p1 >inv1.out 2>&1) || true
+(cd rerun && env FAKE_CLI=old "$SH" "$SCRIPTS/railway_inventory.sh" --project p1 >inv2.out 2>&1) || true
+check "first run wrote service list output" 'grep "service list --json .*ok" rerun/inv1.out >/dev/null'
+check "skipped commands leave no stale output behind" '[ ! -e rerun/$INV/raw/services.json ] && [ ! -e rerun/$INV/raw/domains.json ] && [ ! -e rerun/$INV/raw/domains.web.json ]'
+check "4.16.1 re-run falls back to \`service status --all\`" 'jq -e ".[0].name == \"web\"" rerun/$INV/raw/service-status.json >/dev/null 2>&1'
 
 echo "== nothing works: logged, no secrets file"
 inventory none FAKE_CLI=old FAKE_JSON_BROKEN=1 FAKE_KV_BROKEN=1

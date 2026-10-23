@@ -47,7 +47,7 @@ railway list                                      # projects
 railway link --project <id> --environment production
 railway status --json                             # services, envs, volumes, functions, crons, regions, replicas
 railway environment config --json
-railway service list; railway service status --all --json
+railway service list --json                       # 5.x; on CLI 4.x: railway service status --all --json
 railway domain list --json; railway domain status <domain>
 railway volume list --json; railway bucket list --json; railway bucket info --json -b <name>
 railway functions list; railway cron list

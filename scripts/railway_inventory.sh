@@ -151,7 +151,7 @@ skipped() {
 run_if() {
   local words="$1"; shift
   # shellcheck disable=SC2086  # $words is a space-separated subcommand path
-  if has_subcmd $words; then run "$@"; else skipped "$1"; return 1; fi
+  if has_subcmd $words; then run "$@"; else skipped "$1"; rm -f "$2"; return 1; fi
 }
 
 echo "== Railway inventory: project=$PROJECT environment=$ENVIRONMENT -> $OUT"
@@ -170,7 +170,14 @@ fi
 run_if "domain list" "domain list --json" "$OUT/raw/domains.json" -- railway domain list --json || true
 run_if "volume list" "volume list --json" "$OUT/raw/volumes.json" -- railway volume list --json || true
 run_if "bucket list" "bucket list --json" "$OUT/raw/buckets.json" -- railway bucket list --json || true
-run_if "service status" "service status --all --json" "$OUT/raw/service-status.json" -- railway service status --all --json || true
+# `service status --all` is deprecated in CLI 5.x in favour of `service list`, whose JSON (above) has the
+# same id/name/status fields plus source, regions, replicas and volumes. Older CLIs (4.16.1) only have
+# `service status`.
+if is_json "$OUT/raw/services.json"; then
+  rm -f "$OUT/raw/service-status.json"
+else
+  run_if "service status" "service status --all --json" "$OUT/raw/service-status.json" -- railway service status --all --json || true
+fi
 run_if "cron list" "cron list" "$OUT/raw/crons.txt" -- railway cron list || true
 run_if "functions list" "functions list" "$OUT/raw/functions.txt" -- railway functions list || true
 run_if "environment list" "environment list" "$OUT/raw/environments.txt" -- railway environment list || true
@@ -198,8 +205,15 @@ if [ ${#SERVICES[@]} -eq 0 ] && [ -s "$OUT/raw/services.txt" ]; then
     sed -E 's/\x1b\[[0-9;]*m//g' "$OUT/raw/services.txt" | awk 'NF && $1 !~ /^(NAME|Service|Services|ID|-+)$/ {print $1}' | sort -u)
 fi
 if [ ${#SERVICES[@]} -eq 0 ] && is_json "$OUT/raw/status.json"; then
+  # status --json is the Project query: `services` is project-wide, an environment's services are its
+  # serviceInstances. Use the target environment's when it is there, so services that only exist in
+  # other environments are not inventoried.
   while IFS= read -r s; do [ -n "$s" ] && SERVICES+=("$s"); done < <(
-    jq -r '[.services.edges[]?.node.name?, .services[]?.name?, (.. | objects | select(has("serviceName")) | .serviceName)] | map(select(type=="string")) | unique | .[]' "$OUT/raw/status.json" 2>/dev/null || true)
+    jq -r --arg env "$ENVIRONMENT" '
+      ([.environments.edges[]?.node | select(.name == $env or .id == $env)] | .[0]) as $e
+      | if ($e.serviceInstances.edges? | type) == "array" then [$e.serviceInstances.edges[].node.serviceName?]
+        else [.services.edges[]?.node.name?, .services[]?.name?] end
+      | map(select(type=="string")) | unique | .[]' "$OUT/raw/status.json" 2>/dev/null || true)
 fi
 printf '%s\n' "${SERVICES[@]}" >"$OUT/services.txt"
 echo "services discovered: ${#SERVICES[@]}"
@@ -316,10 +330,12 @@ fi
 run_if "usage projects" "usage projects" "$OUT/raw/usage.json" -- railway usage projects --project "$PROJECT_NAME" --json || true
 
 # ---------------------------------------------------------------- normalized services + SUMMARY.md
-# Heuristic merge of status.json / environment-config.json / service-status.json / railway.ts.
+# Heuristic merge of status.json / environment-config.json / services.json (service list) /
+# service-status.json (older CLIs) / railway.ts.
 # Field names differ across CLI versions; anything not found is "?" and the raw files are listed.
 status_file="$OUT/raw/status.json"; is_json "$status_file" || status_file=/dev/null
 envcfg_file="$OUT/raw/environment-config.json"; is_json "$envcfg_file" || envcfg_file=/dev/null
+svclist_file="$OUT/raw/services.json"; is_json "$svclist_file" || svclist_file=/dev/null
 svcstat_file="$OUT/raw/service-status.json"; is_json "$svcstat_file" || svcstat_file=/dev/null
 domains_file="$OUT/raw/domains.json"; is_json "$domains_file" || domains_file=/dev/null
 volumes_file="$OUT/raw/volumes.json"; is_json "$volumes_file" || volumes_file=/dev/null
@@ -328,6 +344,7 @@ buckets_file="$OUT/raw/buckets.json"; is_json "$buckets_file" || buckets_file=/d
 jq -n \
   --slurpfile status <(jq -c . "$status_file" 2>/dev/null || echo null) \
   --slurpfile envcfg <(jq -c . "$envcfg_file" 2>/dev/null || echo null) \
+  --slurpfile svclist <(jq -c . "$svclist_file" 2>/dev/null || echo null) \
   --slurpfile svcstat <(jq -c . "$svcstat_file" 2>/dev/null || echo null) \
   --slurpfile domains <(jq -c . "$domains_file" 2>/dev/null || echo null) \
   --slurpfile volumes <(jq -c . "$volumes_file" 2>/dev/null || echo null) \
@@ -344,8 +361,9 @@ jq -n \
       services: [ $names[] as $n
         | ( ($status[0] // {}) | objs_named($n) ) as $s
         | ( ($envcfg[0] // {}) | objs_named($n) ) as $c
+        | ( ($svclist[0] // {}) | objs_named($n) ) as $l
         | ( ($svcstat[0] // {}) | objs_named($n) ) as $st
-        | ($s + $c + $st) as $all
+        | ($s + $c + $l + $st) as $all
         | ([ $ts[] | select(.svc==$n) | .line ]) as $tslines
         | {
             name: $n,
@@ -353,8 +371,8 @@ jq -n \
             builder: first_of(pick($all;"builder"), pick($all;"buildCommand")),
             start_command: first_of(pick($all;"startCommand"), ($tslines | map(select(startswith("start:"))) | .[0])),
             healthcheck: first_of(pick($all;"healthcheckPath"), ($tslines | map(select(startswith("healthcheck"))) | .[0])),
-            replicas: first_of(pick($all;"numReplicas"), pick($all;"replicas"), pick($all;"multiRegionConfig"), ($tslines | map(select(startswith("replicas:"))) | .[0])),
-            regions: first_of(pick($all;"region"), pick($all;"regions"), (pick($all;"multiRegionConfig") | if type=="object" then keys else null end)),
+            replicas: first_of(pick($l;"replicas"), pick($all;"numReplicas"), pick($all;"replicas"), pick($all;"multiRegionConfig"), ($tslines | map(select(startswith("replicas:"))) | .[0])),
+            regions: first_of(pick($l;"regions"), pick($all;"region"), pick($all;"regions"), (pick($all;"multiRegionConfig") | if type=="object" then keys else null end)),
             cron: first_of(pick($all;"cronSchedule"), ($tslines | map(select(test("cron"))) | .[0])),
             volumes: first_of(pick($all;"volumeMounts"), pick($all;"volumes"), ($tslines | map(select(startswith("volumeMounts"))) | .[0])),
             domains: first_of(pick($all;"domains"), pick($all;"customDomains"), pick($all;"serviceDomains"), ($tslines | map(select(startswith("domains:"))) | .[0])),
