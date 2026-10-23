@@ -69,9 +69,9 @@ Guard: put_secrets.sh exposed-value check <active | NOT active, because ...>.
 
 Priority order, the same as `breach_check.sh`: AI provider keys (Railway says the attackers were after
 AI inference providers), cloud credentials, databases, payments, source/registry/deploy tokens,
-session/signing secrets, webhook secrets, everything else. Fill the provider and "check for misuse"
-columns only with what you know for that provider; write "check the provider's docs" rather than guess
-a menu path.
+session/signing secrets, webhook secrets, everything else. Fill the "Rotate", "Dual-key?" and "check
+for misuse" columns from the provider table in section 4. For a provider that is not in it, write
+"check the provider's docs" rather than guess a menu path or a grace period.
 
 ## 4. Rotation without an outage
 
@@ -89,6 +89,60 @@ a menu path.
 - Railway's follow-up guidance for cloud keys:
   [AWS](https://blog.railway.com/p/security-disclosure-recommendation-check-for-anomalous-aws-access),
   [GCP](https://blog.railway.com/p/security-disclosure-recommendation-check-for-anomalous-gcp-access).
+
+### Per provider
+
+Copy the "Two live at once?" answer into BREACH.md's "Dual-key?" column as `yes`, `grace <window>` or
+`no`. Every cell comes from the provider's own documentation, checked on 2026-10-22 (sources below the
+table); providers change these rules, so re-check the linked page when a row matters. A provider that
+is not listed gets "check the provider's docs", never a guess.
+
+| Provider / credential | Two live at once? | Safe order | Check for misuse |
+|---|---|---|---|
+| OpenAI API key [1] | yes | Create a replacement, deploy it, confirm it works, revoke the old key. OpenAI says to rotate immediately if a key has leaked. | Usage page: does usage match your team's work? |
+| Anthropic API key [2][3] | yes (keys per environment) | Anthropic's compromise advice is to revoke the key immediately, then create a new one. To avoid an outage, create the new key first and deploy it in the same sitting. (Our judgment, not Anthropic's: if you cannot deploy within minutes, revoke first anyway.) | Console **Logs** and **Usage** pages |
+| AWS IAM access key [4] | yes, two per IAM user | Create the second key, deploy, check the old key's last-used time (`aws iam get-access-key-last-used`), deactivate it (`aws iam update-access-key`), confirm the app still works, then delete it. AWS suggests waiting days between steps; after a breach, deactivate as soon as the new key is confirmed. | Old key's last-used info; CloudTrail per Railway's AWS guidance above |
+| GCP service account key [5][6] | yes, up to 10 keys per service account | Create a new key, deploy, disable the old key, delete it once nothing breaks. Google: deleting a key does not revoke short-lived credentials already issued from it. | Key Authentication Events metric (last use of a key); `serviceAccountKeyName` in Cloud Audit Logs entries; Railway's GCP guidance above |
+| Stripe secret or restricted API key [7] | grace, up to 7 days | Rotate with an expiration just longer than your deploy (or **Now** if you can deploy at once), deploy, watch the old key's request logs reach zero, expire it. For more than 7 days, create a second key manually and expire the old one later. | Per-key **View request logs** (Workbench) |
+| Stripe webhook signing secret [8] | grace, up to 24 hours | **Roll secret** with a delay just long enough to deploy; Stripe sends one signature per active secret until the old one expires. Deploy, then let it expire. | Compare what your handler processed against the endpoint's **Event deliveries** tab |
+| GitHub personal access token [9][10] | yes (up to 50 fine-grained tokens) | Create a new token, deploy, delete the old one. | Your account's security log (last 90 days); the organization audit log for org resources |
+| GitHub OAuth app client secret [11] | yes | GitHub's compromise procedure: generate a new secret, update the app to use it, delete the old secret. | check the provider's docs |
+| GitHub App private key [12] | yes, up to 25 keys | Generate a new key, deploy, delete the old one (GitHub requires a new key before the last one can be deleted). | check the provider's docs |
+| Postgres role password [13][14][15][16] | no, one password per role | `ALTER ROLE ... PASSWORD` and redeploy as one step, inside a short window. Authentication happens when a client connects, so sessions opened with the old password stay open: list them in `pg_stat_activity` and end unknown ones with `pg_terminate_backend`. Railway specifics: section 6. | `pg_stat_activity` (current sessions only). Past connections are logged only if `log_connections` was set; it is off by default. |
+| Resend API key [17] | yes (multiple keys) | Create a new key, deploy, remove the old key. | Dashboard shows each key's last use and request count; the count links to that key's logs |
+| Postmark server or account API token [18][19] | yes (server: generate new, then delete the old; account: up to three tokens) | **Generate New** on the server's API Tokens tab, deploy, delete the existing token. | check the provider's docs |
+| Twilio Auth Token [20][21] | yes, via a secondary token | Create the secondary Auth Token, update and test every app with it, then promote it, which deletes the old primary. Services or Functions (Classic) that include the token directly instead of in a variable need 1 minute for the change to propagate. | Monitor events and Monitor logs for admin changes, message and call logs, usage records [22] |
+| Twilio API key [20] | yes (separate keys per subsystem) | Create a new key, deploy, revoke the compromised key. | Same as the Auth Token row [22] |
+| Sentry DSN (client key) [23][24] | yes (a project can have several client keys) | Sentry says DSNs are safe to keep public: they only submit events. Rotate or revoke under the project's **Client Keys (DSN)** settings if spam events are a concern. | check the provider's docs |
+| Sentry auth token (`SENTRY_AUTH_TOKEN`) [25] | yes (Sentry recommends one token per use case) | Create a new organization or personal token, update CI, revoke the old one. | check the provider's docs |
+
+Sources (checked 2026-10-22):
+
+1. OpenAI, Best practices for API key safety: https://help.openai.com/en/articles/5112595-best-practices-for-api-key-safety
+2. Anthropic, What should I do if I suspect my API key has been compromised: https://support.claude.com/en/articles/8384961-what-should-i-do-if-i-suspect-my-api-key-has-been-compromised
+3. Anthropic, API key best practices: https://support.claude.com/en/articles/9767949-api-key-best-practices-keeping-your-keys-safe-and-secure
+4. AWS, Update access keys: https://docs.aws.amazon.com/IAM/latest/UserGuide/id-credentials-access-keys-update.html
+5. Google Cloud, Create and delete service account keys: https://docs.cloud.google.com/iam/docs/keys-create-delete
+6. Google Cloud, Best practices for managing service account keys: https://docs.cloud.google.com/iam/docs/best-practices-for-managing-service-account-keys
+7. Stripe, API keys (rotate, grace period, request logs): https://docs.stripe.com/keys
+8. Stripe, Webhooks (roll endpoint signing secrets): https://docs.stripe.com/webhooks
+9. GitHub, Managing your personal access tokens: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
+10. GitHub, Reviewing your security log: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/reviewing-your-security-log
+11. GitHub, Best practices for creating an OAuth app: https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/best-practices-for-creating-an-oauth-app
+12. GitHub, Managing private keys for GitHub Apps: https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/managing-private-keys-for-github-apps
+13. PostgreSQL, `pg_authid` (one `rolpassword` per role): https://www.postgresql.org/docs/current/catalog-pg-authid.html
+14. PostgreSQL, Client authentication: https://www.postgresql.org/docs/current/client-authentication.html
+15. PostgreSQL, Server signaling functions (`pg_terminate_backend`): https://www.postgresql.org/docs/current/functions-admin.html
+16. PostgreSQL, Error reporting and logging (`log_connections`): https://www.postgresql.org/docs/current/runtime-config-logging.html
+17. Resend, API keys: https://resend.com/docs/dashboard/api-keys/introduction
+18. Postmark, How to cycle a server API token: https://postmarkapp.com/support/article/1293-how-to-cycle-a-server-api-token
+19. Postmark, More than one account API token: https://postmarkapp.com/support/article/1212-can-you-have-more-than-one-account-api-token-at-a-time
+20. Twilio, Auth Token API and API keys: https://www.twilio.com/docs/iam/api/authtoken and https://www.twilio.com/docs/iam/api-keys
+21. Twilio, Fraud response guide, contain: https://www.twilio.com/docs/usage/fraud-response-guide/contain
+22. Twilio, Fraud response guide, diagnose: https://www.twilio.com/docs/usage/fraud-response-guide/diagnose
+23. Sentry, Data Source Name (DSN): https://docs.sentry.io/concepts/key-terms/dsn-explainer/
+24. Sentry API, Create a new client key: https://docs.sentry.io/api/projects/create-a-new-client-key/
+25. Sentry, Auth tokens: https://docs.sentry.io/account/auth-tokens/
 
 ## 5. Session, signing and encryption secrets
 
