@@ -1,17 +1,17 @@
 # Derail
 
-**Railway got breached and can't stay up. Get off it. This Claude skill plans and generates the whole
-move to AWS, with Terraform.**
+**Railway disclosed an environment-variable breach. If you're leaving, this Claude skill plans and
+generates the whole move to AWS, with Terraform.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Terraform 1.11+](https://img.shields.io/badge/Terraform-%E2%89%A5%201.11-7B42BC)
 ![OpenTofu 1.11+](https://img.shields.io/badge/OpenTofu-%E2%89%A5%201.11-FFDA18)
 ![AWS provider 6.x](https://img.shields.io/badge/AWS%20provider-6.x-FF9900)
 
-On October 21, 2026, Railway told every customer to roll every environment variable they had ever
-stored there. An attacker got into the systems that hold them and, for some customers, walked away with
-the decrypted values. Deploys were frozen while they figured out what happened. That came after a
-year of the whole platform going dark for reasons customers couldn't control.
+On October 21, 2026, Railway told every customer to roll all of their environment variables. An
+attacker may have accessed the systems that store them and, for some variables, obtained the decrypted
+contents; Railway's first analysis suggests a subset of users is affected. Deploys were paused while
+they investigated. That followed two platform incidents earlier in the year (below).
 
 If you're done waiting for the next status-page update, point this skill at your Railway app (and your
 Vercel frontend, if you have one). It produces a complete migration package: an inventory of everything
@@ -50,11 +50,10 @@ incident reports and disclosures:
 |---|---|
 | **Feb 11** | Railway's own anti-fraud system misfired and sent SIGTERM to about 3% of services on the platform, **including customer Postgres and MySQL databases**. Roughly four hours until automated recovery finished. ([incident report](https://blog.railway.com/p/incident-report-february-11-2026)) |
 | **May 19 to 20** | Google Cloud suspended Railway's production account. **Every workload in every region went unreachable** for about eight hours, including ones running on Railway Metal and AWS, because routing still depended on a control plane in GCP. ([incident report](https://blog.railway.com/p/incident-report-may-19-2026-gcp-account-outage)) |
-| **Oct 21 to 22** | An unauthorized party accessed the systems that store customer environment variables and, for some customers, obtained decrypted contents: API keys, database credentials, registry credentials. All deployments paused. Railway's advice to everyone: roll all of it. ([disclosure](https://blog.railway.com/p/security-disclosure-wednesday-october-21st), [TechCrunch](https://techcrunch.com/2026/10/22/developer-platform-railway-urges-all-users-to-revoke-secret-keys-after-cyberattack/)) |
+| **Oct 21** | An unauthorized party may have accessed the systems that store customer environment variables and, for some variables, obtained decrypted contents, which can include API keys and database and registry credentials. Railway says impact may be limited to a subset of users. All deployments paused. Railway's advice to everyone: roll all of it. ([disclosure](https://blog.railway.com/p/security-disclosure-wednesday-october-21st), [TechCrunch](https://techcrunch.com/2026/10/22/developer-platform-railway-urges-all-users-to-revoke-secret-keys-after-cyberattack/)) |
 
-That's on top of the smaller stuff any status-page watcher has seen: stuck deploys, routing 404s,
-dashboard and login slowdowns. One platform-wide failure is bad luck. A pattern of them, ending in a
-secrets breach, is a reason to own your infrastructure.
+One incident is bad luck. Three in one year, the last a secrets breach, is a reason to own your
+infrastructure.
 
 AWS isn't magic and it isn't cheaper (see [Cost](#cost-the-honest-version)). What you get is
 infrastructure you control, defined in code you can read, in an account with your own IAM, your own
@@ -137,8 +136,15 @@ you don't need Railway to be up to plan your exit.
 git clone https://github.com/upnorthmedia/derail ~/.claude/skills/derail
 ```
 
-**Claude.ai / Cowork**: upload `derail.skill` from the latest release (or build one with
-`python -m scripts.package_skill .` from the skill-creator skill).
+**Claude.ai / Cowork**: upload `derail.skill` from the
+[latest release](https://github.com/upnorthmedia/derail/releases/latest), or build it yourself from a
+`git archive` export (not a clone, which would pack `.git/` into the file):
+
+```bash
+rm -rf /tmp/derail-export && mkdir -p /tmp/derail-export/derail
+git -C ~/.claude/skills/derail archive HEAD | tar -x -C /tmp/derail-export/derail
+cd <skill-creator skill directory> && python3 -m scripts.package_skill /tmp/derail-export/derail /tmp/derail-export
+```
 
 Then ask, in your own words:
 
@@ -204,7 +210,7 @@ holds verified us-east-1 list prices (October 2026) and prints an itemised table
 
 | Tier | What it is | Per project / month |
 |---|---|---|
-| **shared** | `platform/` root: one ALB, one cluster, one RDS instance shared by N projects; 0.25 vCPU task | **~$25** (4 tenants) · ~$20 with a Spot web task · ~$13 with 8 tenants |
+| **shared** | `platform/` root: one ALB, one cluster, one RDS instance shared by N projects; 0.25 vCPU task | **~$25** (4 tenants) · ~$20 with a Spot web task · ~$13 with 8 tenants and Spot |
 | **budget** | Dedicated ALB, `db.t4g.micro`, no NAT, CloudFront Free plan | ~$50 |
 | **standard** | `db.t4g.small`, CloudFront Pro + WAF, Valkey if needed | ~$90 |
 | **production** | Multi-AZ, private subnets + NAT, 2+ tasks, AWS Backup, Container Insights | ~$180+ |
@@ -237,6 +243,7 @@ deletion protection) are spelled out in the plan every time.
 | Next.js + Better Auth + Stripe + Twilio + PostGIS on Vercel, Postgres on Railway, DNS on Vercel | yes (eval) |
 | FastAPI + Celery + Redis + Postgres + cron + upload volume, all on Railway, sealed secret, static egress IP | yes (eval) |
 | Shopify embedded app (React Router + Prisma) + nightly cron + Postgres on Railway, platform hostname only | yes (eval) |
+| Next.js 16 + pg-boss worker + Postgres 17 on Railway, Better Auth, OpenAI + Anthropic, Stripe, values exposed in the Oct 21 breach (breach mode) | eval written, benchmark pending |
 | Generic Node (Express/Fastify/Hono/Nest), Django, Rails, Go | Dockerfiles and references cover them; no eval yet |
 
 Railway Redis/MySQL/Mongo, buckets, volumes, TCP proxies, private networking, PR environments and
@@ -266,8 +273,8 @@ Terraform modules: `alb_https`, `ecs_service`, `rds_postgres`, `valkey`, `secret
 
 ## Running the evals
 
-Each folder under `evals/` is a realistic prompt plus input files and graders. With Claude Code
-(v2.1.269 or later) run them with and without the skill:
+Each folder under `evals/` is a realistic prompt plus input files and graders. With Claude Code, run
+them with and without the skill:
 
 ```bash
 claude plugin eval . --allow-tools Write,Edit,Bash --scaffold
