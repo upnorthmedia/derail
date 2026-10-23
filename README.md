@@ -99,7 +99,8 @@ house with you.
    credentials, OAuth client secrets, webhook signing secrets, session and auth secrets.
 2. **Revoke and reissue them at the source** (Stripe, OpenAI, Anthropic, Twilio, your registry, your
    cloud provider), then update Railway so production keeps running while you migrate. Where a provider
-   allows two live keys, deploy the new one before revoking the old.
+   allows two live keys, deploy the new one before revoking the old; `breach_check.sh` marks each key it
+   recognises with `two live`, `grace` or `hard cut`.
 3. **Check the providers' logs for use you didn't make.** Railway published follow-up guidance for
    [GCP](https://blog.railway.com/p/security-disclosure-recommendation-check-for-anomalous-gcp-access)
    and [AWS](https://blog.railway.com/p/security-disclosure-recommendation-check-for-anomalous-aws-access)
