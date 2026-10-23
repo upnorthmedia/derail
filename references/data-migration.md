@@ -32,7 +32,8 @@ vercel.com/docs, payloadcms.com. Scripts: `scripts/pg_migrate.sh`, `scripts/sql/
 ## 2. Dump and restore
 
 ```bash
-# Source: SSH tunnel (preferred; no public exposure, no egress billing)
+# Source: SSH tunnel (preferred; no public exposure, no egress billing). Needs Railway CLI >= 5.27.0
+# (4.x has no --tunnel-only; `railway --version`)
 railway connect postgres --tunnel-only            # prints local host/port/password; keep running
 export SRC_URL='postgresql://postgres:<pw>@localhost:<port>/railway'
 # Target: RDS master, from a machine that can reach the private subnet (SSM port-forward / CloudShell
@@ -53,6 +54,17 @@ CloudShell with VPC access, or an SSM port-forward from a laptop through that ho
 (`terraform output migration_host_port_forward_commands`). Dumping from Railway over the SSH tunnel
 works from wherever `railway` CLI runs; move the dump directory to the host with `aws s3 cp` to a
 private staging prefix and delete it afterwards.
+
+*(Breach mode only)* The Postgres password and `DATABASE_PUBLIC_URL` were exposed, and the TCP proxy
+makes them usable from anywhere on the internet. Before the first rehearsal dump: rotate the password
+(`references/breach-response.md` section 6), then delete the proxy so the database is reachable only
+through the tunnel above. First confirm nothing outside Railway still uses `DATABASE_PUBLIC_URL` (CI
+jobs, BI tools, local clients; check the inventory and `CODEBASE.md`). Then
+`railway tcp-proxy list --service <postgres>` and `railway tcp-proxy delete <id>` (CLI >= 5.15.0), or
+remove it in the dashboard under the service's Settings > Networking. `railway connect` tunnels over SSH
+when the service has no proxy. If a dump cannot use the tunnel, or you run logical replication (section
+3), re-create the proxy for that window only (`railway tcp-proxy create --port 5432 --service <postgres>`;
+read the new domain and port from `tcp-proxy list`) and delete it when the window closes.
 
 Flag rationale: directory format is the only one that supports parallel `--jobs`; `--no-owner
 --no-privileges` strip Railway role references; `--no-subscriptions --no-publications` avoid dragging
@@ -86,7 +98,9 @@ port=<port> dbname=railway user=repl password=... sslmode=require' PUBLICATION a
 instance needs an outbound route to Railway's public TCP proxy (NAT on the private subnets, or a
 publicly accessible instance during migration). Cutover: stop writes, wait for lag 0, **resync
 sequences** (not replicated), flip, `DROP SUBSCRIPTION` (an orphaned slot fills Railway's volume).
-Limitations: no DDL, no sequences, no large objects.
+Limitations: no DDL, no sequences, no large objects. *(Breach mode only)* The proxy stays up for the
+whole replication period, so create the replication role after the password rotation, give it a fresh
+password, and delete the proxy right after `DROP SUBSCRIPTION` at cutover.
 
 **AWS DMS**: works in principle (self-managed PG source over the proxy, SSL `require`, needs a superuser
 for CDC) but adds a replication instance, does not migrate sequences, and PG 17/18 sources are not
