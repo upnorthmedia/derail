@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.27@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # Generic Node.js service (Express, Fastify, Hono, NestJS, workers) for ECS Fargate.
 # Replaces Railway's Railpack/Nixpacks auto-build. Edit the three marked lines to match package.json scripts.
 #
@@ -21,10 +21,16 @@
 # Lockfiles: `pnpm install --frozen-lockfile` / `npm ci` fail when the lockfile is stale or a stub. Regenerate
 # locally (`pnpm install`, `npm install`) and commit before building.
 
-ARG NODE_VERSION=24-bookworm-slim
 ARG RDS_CA_BUNDLE_URL=https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 
-FROM node:${NODE_VERSION} AS deps
+# Base images are pinned by digest (tag kept for readability), so a rebuild never silently picks up a
+# different image. Refresh: `docker buildx imagetools inspect <image:tag>` and copy the top-level
+# "Digest:" (the multi-arch index, which includes linux/arm64). To change the Node version, change the
+# tag AND the digest. Renovate and Dependabot (package-ecosystem: docker) both bump `FROM image:tag@sha256:...`
+# lines; Dependabot ignores ARG and COPY --from, hence one literal FROM per image. Renovate also bumps `# syntax=`.
+FROM node:24-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS base
+
+FROM base AS deps
 WORKDIR /app
 COPY package.json pnpm-lock.yaml* package-lock.json* yarn.lock* .npmrc* ./
 RUN --mount=type=cache,target=/root/.npm \
@@ -35,7 +41,7 @@ RUN --mount=type=cache,target=/root/.npm \
     else echo "No lockfile found" && exit 1; fi
 
 # ---------- builder: compile with dev deps present ----------
-FROM node:${NODE_VERSION} AS builder
+FROM base AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -46,7 +52,7 @@ ENV NODE_ENV=production
 RUN sh -c 'if [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm run build; else npm run build; fi'
 
 # ---------- tools: full deps + source + build output (NOT the final stage) ----------
-FROM node:${NODE_VERSION} AS tools
+FROM base AS tools
 ARG RDS_CA_BUNDLE_URL
 WORKDIR /app
 ENV NODE_ENV=production RDS_CA_BUNDLE_PATH=/app/global-bundle.pem
@@ -68,7 +74,7 @@ FROM builder AS prod-deps
 RUN sh -c 'if [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm prune --prod; else npm prune --omit=dev; fi'
 
 # ---------- runner: final/default stage ----------
-FROM node:${NODE_VERSION} AS runner
+FROM base AS runner
 ARG RDS_CA_BUNDLE_URL
 WORKDIR /app
 ENV NODE_ENV=production PORT=3000 RDS_CA_BUNDLE_PATH=/app/global-bundle.pem
