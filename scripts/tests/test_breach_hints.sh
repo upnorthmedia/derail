@@ -56,6 +56,7 @@ FX_STRIPE="sk_live""_FIXTUREstripe000000001"
 FX_WHSEC="whsec""_FIXTUREwebhook00000001"
 FX_GHP="ghp""_FIXTUREgithub00000000000001"
 FX_AKIA="AKIA""FIXTURE000000001"
+FX_REDISPW="FIXTURE""redis0000001"
 FX_PGPASS="FIXTUREpgpass000000001"
 cat >"$T/fixture/vars/web.json" <<EOF
 {"OPENAI_API_KEY":"sk-proj-FIXTUREopenai0000000000001","ANTHROPIC_API_KEY":"sk-ant-FIXTUREanthropic000000001",
@@ -71,7 +72,7 @@ cat >"$T/fixture/vars/web.json" <<EOF
  "OPENAI_API_KEY_OLD":"sk-proj-FIXTUREopenaiold00000000001",
  "GCP_SERVICE_ACCOUNT_KEY":"{\"type\":\"service_account\",\"private_key\":\"FIXTUREgcpkey000000001\"}",
  "GOOGLE_APPLICATION_CREDENTIALS":"/app/FIXTURE-credentials.json",
- "DATABASE_URL":"\${{Postgres.DATABASE_URL}}","REDIS_URL":"redis://default:FIXTUREredis0000001@redis.railway.internal:6379"}
+ "DATABASE_URL":"\${{Postgres.DATABASE_URL}}","REDIS_URL":"redis://default:$FX_REDISPW@redis.railway.internal:6379"}
 EOF
 cat >"$T/fixture/vars/Postgres.json" <<EOF
 {"DATABASE_URL":"postgresql://postgres:$FX_PGPASS@postgres.railway.internal:5432/railway",

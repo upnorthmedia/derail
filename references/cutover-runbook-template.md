@@ -104,7 +104,9 @@ apply it to Railway. After the decision deadline, rollback is no longer on the t
 - Day 1-2: **rotate** what was exported or dual-registered: RDS app-user password, old webhook
   endpoints and secrets deleted, `BLOB_READ_WRITE_TOKEN`, any API key that lived in Vercel/Railway env.
   Schedule the `PAYLOAD_SECRET`/`AUTH_SECRET` rotation with a user re-login notice.
-  *(Breach mode: these already rotated before or during cutover; skip this item.)*
+  *(Breach mode: the Railway-sourced keys among these already rotated before or during cutover. Still
+  delete the old webhook endpoints and rotate `BLOB_READ_WRITE_TOKEN` and anything exported from Vercel:
+  `breach_check.sh` reads Railway only.)*
 - *(Breach mode only)* Day 1, after the rollback deadline: plant a canary credential in the old Railway
   environment, so that anyone who reads Railway's variables from now on and uses what they find raises an
   alert. The user picks the provider and creates it; for example (checked 2026-10-22) the free

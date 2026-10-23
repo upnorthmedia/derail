@@ -320,6 +320,12 @@ loose="$(find out out5 p_out d_evt d_um1 d_um2 d_fdw \( -type f ! -perm 600 \) -
 check "every file in --out is mode 600 and every directory 700 (reports, logs, TOC lists, dumps)" '[ -z "$loose" ]'
 [ -z "$loose" ] || printf '%s\n' "$loose" | head -n 5 | sed 's/^/        /'
 
+# On failure, show what pg_migrate.sh printed (CI keeps no other trace of it once the temp dir is gone).
+# Its output is masked, and every planted value here is a FIXTURE.
+if [ "$FAIL" -gt 0 ]; then
+  for f in r*.txt; do [ -s "$f" ] || continue; echo "---- $f (last 15 lines)"; tail -n 15 "$f"; done
+fi
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

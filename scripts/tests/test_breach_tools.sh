@@ -57,8 +57,11 @@ case "${1:-} ${2:-}" in
   "link "*) : ;;
   "variable list")
     if [ -n "${FAKE_NO_VARIABLE_SUBCMD:-}" ]; then echo "error: unrecognized subcommand 'variable'" >&2; exit 2; fi
+    if [ "$svc" = "${FAKE_FAIL_SERVICE:-}" ]; then echo "error: failed to fetch variables" >&2; exit 1; fi
     cat "$D/vars/$svc.json" ;;
-  "variables "*) cat "$D/vars/$svc.json" ;;
+  "variables "*)
+    if [ "$svc" = "${FAKE_FAIL_SERVICE:-}" ]; then echo "error: failed to fetch variables" >&2; exit 1; fi
+    cat "$D/vars/$svc.json" ;;
   "service list") echo '[{"name":"web"},{"name":"Postgres"}]' ;;
   *) echo "fake railway: unhandled: $*" >&2; exit 64 ;;
 esac
@@ -142,6 +145,26 @@ fi
 
 FAKE_NO_VARIABLE_SUBCMD=1 "$SH" "$SCRIPTS/breach_check.sh" --out fallback.md >/dev/null 2>&1 || true
 check "falls back to \`railway variables\` on older CLIs" 'grep -q "OPENAI_API_KEY" fallback.md'
+
+# Re-running --fingerprint after rotation started would replace the record of the exposed values.
+cp secrets/railway.burned.sha256 burned.before
+rc=0; "$SH" "$SCRIPTS/breach_check.sh" --out again.md --fingerprint secrets/railway.burned.sha256 >again.txt 2>&1 || rc=$?
+check "--fingerprint refuses to overwrite an existing fingerprint file (exit 2)" '[ "$rc" -eq 2 ] && grep >/dev/null "already exists" again.txt'
+check "the existing fingerprint file is unchanged" 'cmp -s burned.before secrets/railway.burned.sha256'
+
+# --verify must not pass the gate when a service could not be read.
+printf '%s\t%s\n' "0000000000000000000000000000000000000000000000000000000000000000" "nowhere/NONE" >none.sha256
+rc=0; "$SH" "$SCRIPTS/breach_check.sh" --out vok.md --verify none.sha256 >vok.txt 2>&1 || rc=$?
+check "--verify with nothing exposed and every service read exits 0" '[ "$rc" -eq 0 ]'
+rc=0; FAKE_FAIL_SERVICE=Postgres "$SH" "$SCRIPTS/breach_check.sh" --out vfail.md --verify none.sha256 >vfail.txt 2>&1 || rc=$?
+check "--verify exits 3 when a service could not be read and nothing else is exposed" '[ "$rc" -eq 3 ]'
+check "it says the result is incomplete" 'grep >/dev/null "could not be read" vfail.txt'
+rc=0; FAKE_FAIL_SERVICE=Postgres "$SH" "$SCRIPTS/breach_check.sh" --out vboth.md --verify secrets/railway.burned.sha256 >/dev/null 2>&1 || rc=$?
+check "an exposed value still exits 1 when a service also failed" '[ "$rc" -eq 1 ]'
+
+# The secrets directory is private from the moment it is created.
+rc=0; (umask 022; "$SH" "$SCRIPTS/breach_check.sh" --out fresh.md --fingerprint fresh/.secrets/railway.burned.sha256 >/dev/null 2>&1) || rc=$?
+check "a new --fingerprint directory is created mode 700" '[ "$rc" -eq 0 ] && [ "$(stat -c %a fresh/.secrets 2>/dev/null || stat -f %Lp fresh/.secrets)" = "700" ]'
 
 echo "== railway_inventory.sh (shared classifier)"
 mkdir -p inv && (cd inv && "$SH" "$SCRIPTS/railway_inventory.sh" --project p1 >inv.out 2>&1) || true
