@@ -24,10 +24,11 @@ ADMIN_URL="${PG_AUDIT_ADMIN_URL:-}"
 cleanup() {
   if [ -n "$CID" ]; then docker rm -f "$CID" >/dev/null 2>&1 || true; fi
   if [ -n "${PG_AUDIT_ADMIN_URL:-}" ]; then
-    for db in pg_audit_test rs_evt rs_um r_evt_role r_evt_keep r_evt_keep_role r_um r_um_keep r_um_fail; do
+    for db in pg_audit_test rs_evt rs_um r_evt_role r_evt_keep r_evt_keep_role r_um r_um_keep r_um_fail \
+      rs_fdw r_fdw r_fdw_norole r_fdw_fail r_fdw_warn; do
       psql "$ADMIN_URL" -X -q -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1 || true
     done
-    for role in intruder ghost app_owner; do
+    for role in intruder ghost mig_admin app_owner; do
       psql "$ADMIN_URL" -X -q -c "DROP ROLE IF EXISTS $role" >/dev/null 2>&1 || true
     done
   fi
@@ -244,13 +245,74 @@ check "--keep-user-mappings with a mapping for a missing role fails (exit 1)" '[
 check "the failed restore's error output does not print the mapping password" '! grep "FIXTUREumpass" r8.txt >/dev/null'
 check "no mapping password in restore output" '! cat r4.txt r5.txt r6.txt r7.txt | grep "FIXTUREumpass" >/dev/null'
 
+# A foreign server in the dump aborted `restore --role app_owner` ("permission denied for foreign-data
+# wrapper"): app_owner has no USAGE on the wrapper the master just created. restore grants it for the
+# pg_restore only and revokes it afterwards, also when pg_restore fails.
+echo "== restore: foreign servers with --role"
+psql "$ADMIN_URL" -X -q -v ON_ERROR_STOP=1 -c 'CREATE DATABASE rs_fdw' >/dev/null
+psql "$(url_db rs_fdw)" -X -q -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE TABLE public.items (id bigserial PRIMARY KEY, name text);
+INSERT INTO public.items (name) VALUES ('a');
+CREATE EXTENSION postgres_fdw;
+CREATE SERVER report_srv FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host 'report.invalid', dbname 'x');
+CREATE FOREIGN TABLE public.remote_items (id int, v text) SERVER report_srv OPTIONS (table_name 'items');
+CREATE VIEW public.remote_view AS SELECT id, v FROM public.remote_items;
+SQL
+fdw_usage() { psql "$(url_db "$1")" -X -q -At -c "SELECT has_foreign_data_wrapper_privilege('app_owner', 'postgres_fdw', 'USAGE')" 2>/dev/null || echo "?"; }
+rc=0; mig rs_fdw dump --out d_fdw >r10.txt 2>&1 || rc=$?
+rc=0; mig rs_fdw restore --out d_fdw --target-db r_fdw --role app_owner >r11.txt 2>&1 || rc=$?
+check "restore --role app_owner exits 0 when the dump has a foreign server" '[ "$rc" -eq 0 ]'
+check "it verifies OK" 'grep >/dev/null "VERIFY: OK" r11.txt'
+check "the server, foreign table and view are restored and owned by app_owner" \
+  '[ "$(psql "$(url_db r_fdw)" -X -q -At -c "SELECT string_agg(o, '"','"' ORDER BY o) FROM (SELECT srvname || '"':'"' || pg_get_userbyid(srvowner) AS o FROM pg_foreign_server UNION ALL SELECT relname || '"':'"' || pg_get_userbyid(relowner) FROM pg_class WHERE relname IN ('"'remote_items'"', '"'remote_view'"')) s")" = "remote_items:app_owner,remote_view:app_owner,report_srv:app_owner" ]'
+check "the grant and the revoke are logged by wrapper name" \
+  'grep "granted USAGE" r11.txt | grep >/dev/null postgres_fdw && grep "revoked USAGE" r11.txt | grep >/dev/null postgres_fdw'
+check "app_owner has no USAGE on the wrapper afterwards" '[ "$(fdw_usage r_fdw)" = "f" ]'
+rc=0; mig rs_fdw restore --out d_fdw --target-db r_fdw_norole >r12.txt 2>&1 || rc=$?
+check "restore without --role does not grant anything" '[ "$rc" -eq 0 ] && ! grep -i "foreign.data wrapper" r12.txt >/dev/null'
+check "a dump without foreign servers does not grant anything" '! grep -i "foreign.data wrapper" r1.txt >/dev/null'
+# failure after the grant: the mapping for the missing role `ghost` aborts pg_restore
+rc=0; mig rs_um restore --out d_um1 --target-db r_fdw_fail --role app_owner --keep-user-mappings >r13.txt 2>&1 || rc=$?
+check "a restore that fails after the grant exits 1" '[ "$rc" -eq 1 ]'
+check "it still revokes the grant" 'grep >/dev/null "revoked USAGE" r13.txt && [ "$(fdw_usage r_fdw_fail)" = "f" ]'
+# a master that holds USAGE without the grant option (not the wrapper's owner): its GRANT only warns and
+# exits 0, so restore must read the privilege back and point to the fallback
+psql "$ADMIN_URL" -X -q -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE ROLE mig_admin LOGIN CREATEDB PASSWORD 'FIXTUREmigadmin0001';
+GRANT app_owner TO mig_admin;
+CREATE DATABASE r_fdw_warn OWNER mig_admin;
+SQL
+psql "$(url_db r_fdw_warn)" -X -q -v ON_ERROR_STOP=1 \
+  -c 'CREATE EXTENSION postgres_fdw' -c 'GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO mig_admin' >/dev/null
+MIG_ADMIN_URL="$(printf '%s' "$ADMIN_URL" | sed -E 's#://[^@]*@#://mig_admin:FIXTUREmigadmin0001@#')"
+rc=0; env SRC_URL="$(url_db rs_fdw)" TGT_URL="$MIG_ADMIN_URL" "$SH" "$SCRIPTS/pg_migrate.sh" restore --out d_fdw \
+  --target-db r_fdw_warn --role app_owner >r14.txt 2>&1 || rc=$?
+check "an ineffective GRANT is reported, naming restore without --role" \
+  'grep "WARN" r14.txt | grep "postgres_fdw" >/dev/null && grep >/dev/null "restore without --role" r14.txt'
+check "it is not logged as granted, and pg_restore fails as before (exit 1)" \
+  '[ "$rc" -eq 1 ] && ! grep "granted USAGE" r14.txt >/dev/null && grep >/dev/null "permission denied for foreign-data wrapper" r14.txt'
+
+echo "== .gitignore"
+if command -v git >/dev/null 2>&1; then
+  mkdir -p repo && (cd repo && git init -q . && SRC_URL="$DB_URL" "$SH" "$SCRIPTS/pg_migrate.sh" audit --out migration/db >../gi1.txt 2>&1) || true
+  check "--out is added to the repo's .gitignore" 'grep -xF "migration/db/" repo/.gitignore >/dev/null 2>&1'
+  check "it says so" 'grep "gitignore: added" gi1.txt | grep >/dev/null "migration/db/"'
+  check "git does not see the audit report" '[ -z "$(cd repo && git status --porcelain --untracked-files=all | grep "db-audit")" ]'
+  (cd repo && SRC_URL="$DB_URL" "$SH" "$SCRIPTS/pg_migrate.sh" audit --out migration/db >../gi2.txt 2>&1) || true
+  check "a second run does not add it again" '[ "$(grep -cxF "migration/db/" repo/.gitignore 2>/dev/null)" = "1" ]'
+  mkdir -p repo2 && (cd repo2 && git init -q . && SRC_URL="$DB_URL" "$SH" "$SCRIPTS/pg_migrate.sh" audit --dry-run --out migration/db >/dev/null 2>&1) || true
+  check "--dry-run leaves .gitignore alone" '[ ! -e repo2/.gitignore ]'
+else
+  echo "  skip  .gitignore checks (git not installed)"
+fi
+
 # Reports, logs and dumps can hold credentials (a failed restore's log echoes the failing CREATE USER
 # MAPPING with its password), so everything written into --out is private to the user.
 echo "== file modes in --out"
 rc=0; mig rs_evt preflight --out p_out >r9.txt 2>&1 || rc=$?
 check "preflight exits 0" '[ "$rc" -eq 0 ]'
 check "the failed restore wrote its log" 'ls d_um1/restore-*.log >/dev/null 2>&1'
-loose="$(find out out5 p_out d_evt d_um1 d_um2 \( -type f ! -perm 600 \) -o \( -type d ! -perm 700 \) 2>/dev/null || true)"
+loose="$(find out out5 p_out d_evt d_um1 d_um2 d_fdw \( -type f ! -perm 600 \) -o \( -type d ! -perm 700 \) 2>/dev/null || true)"
 check "every file in --out is mode 600 and every directory 700 (reports, logs, TOC lists, dumps)" '[ -z "$loose" ]'
 [ -z "$loose" ] || printf '%s\n' "$loose" | head -n 5 | sed 's/^/        /'
 

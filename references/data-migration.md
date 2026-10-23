@@ -73,10 +73,20 @@ before a major version upgrade) and a user mapping carries another server's cred
 `--keep-event-triggers` (without `--role`) or `--keep-user-mappings` only for ones the db-audit report
 shows are yours.
 
+Foreign servers (`postgres_fdw` and other wrappers) are restored. With `--role`, `restore` grants that role
+USAGE on the target's foreign-data wrappers for the `pg_restore` only and revokes it afterwards (also when
+`pg_restore` fails), so the servers, foreign tables and views on them end up owned by the role. If the
+grant does not take effect, `restore` prints a WARN and `pg_restore` stops with
+`permission denied for foreign-data wrapper`; restore without `--role` instead (objects are then owned by
+the master user). The servers come back without their user mappings unless you pass
+`--keep-user-mappings`, so create a mapping with a new credential for each one the app still needs.
+
 Everything `pg_migrate.sh` writes under `--out` (default `migration/db`: dumps, reports, TOC lists,
 `restore-<stamp>.log`) is created mode 600, with new directories 700. The dump holds every row and any
 user-mapping password in plain text, and a failed restore's log repeats the failing statement, which can
-include that password. Keep the directory out of git and shared drives.
+include that password. Every run except `--dry-run` adds `--out` to the `.gitignore` at the root of the
+git repository that contains it (or to `./.gitignore` outside a repository), once. Keep the directory off
+shared drives too.
 
 `dump` uses `--no-owner --no-privileges`, which drops ownership but not the objects themselves: every
 function, trigger, rule and foreign server in the source is restored (event triggers and user mappings only
