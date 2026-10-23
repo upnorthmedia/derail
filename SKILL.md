@@ -195,7 +195,9 @@ Read `references/terraform-conventions.md` first. Then:
    `NEXT_PUBLIC_*`/`VITE_*` variable, keep the RDS CA bundle lines, copy `dockerignore` to
    `.dockerignore`. Base images are pinned by digest on one `FROM <image>:<tag>@sha256:... AS base`
    line; to change the Node/Python version, change the tag and the digest together
-   (`docker buildx imagetools inspect <image:tag>`). The Node/Next.js files have two targets: `runner` (what the service runs) and
+   (`docker buildx imagetools inspect <image:tag>`). Copy `assets/github/dependabot.yml` to
+   `.github/dependabot.yml` so the digest pins and the workflow actions get weekly update PRs.
+   The Node/Next.js files have two targets: `runner` (what the service runs) and
    `tools` (full dependencies for migrations, built as `<sha>-tools`); the migration task uses the tools
    image because the standalone runner cannot run `payload migrate`, `drizzle-kit`, `prisma` or
    `auth migrate`. Build locally if Docker is available and fix what fails.
@@ -274,6 +276,7 @@ when they have it (plans contain no secret values with this layout).
     BREACH.md    BREACH-CHECK.md   (breach mode only; fingerprints in .secrets/railway.burned.sha256)
   infra/         bootstrap/  network/  modules/  live/<project>/<env>/  Makefile  .tflint.hcl  ...
   .github/workflows/terraform.yml  deploy.yml
+  .github/dependabot.yml
   Dockerfile  .dockerignore  (+ app code changes on a branch)
 ```
 

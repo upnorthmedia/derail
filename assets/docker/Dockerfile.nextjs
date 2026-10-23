@@ -43,13 +43,18 @@ FROM node:24-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054f
 # ---------- deps: install exactly what the lockfile says ----------
 FROM base AS deps
 WORKDIR /app
-COPY package.json pnpm-lock.yaml* package-lock.json* yarn.lock* .npmrc* ./
+# pnpm-workspace.yaml carries pnpm's allowBuilds (dependency build scripts approved with `pnpm approve-builds`,
+# e.g. sharp); without it `pnpm install` stops with ERR_PNPM_IGNORED_BUILDS. Yarn 2+ defaults to Plug'n'Play,
+# which writes no node_modules, so the yarn branch forces the node-modules linker. mkdir: an app with no
+# dependencies gets no node_modules from npm, and the COPY --from=deps below needs one.
+COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml* package-lock.json* yarn.lock* .npmrc* ./
 RUN --mount=type=cache,target=/root/.npm \
     --mount=type=cache,target=/root/.local/share/pnpm/store \
     if [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm install --frozen-lockfile; \
     elif [ -f package-lock.json ]; then npm ci --no-audit --no-fund; \
-    elif [ -f yarn.lock ]; then corepack enable yarn && yarn install --frozen-lockfile; \
-    else echo "No lockfile found. Commit one (pnpm-lock.yaml, package-lock.json or yarn.lock)." && exit 1; fi
+    elif [ -f yarn.lock ]; then corepack enable yarn && YARN_NODE_LINKER=node-modules yarn install --frozen-lockfile; \
+    else echo "No lockfile found. Commit one (pnpm-lock.yaml, package-lock.json or yarn.lock)." && exit 1; fi \
+ && mkdir -p node_modules
 
 # ---------- builder: next build ----------
 FROM base AS builder
@@ -65,11 +70,11 @@ ENV NEXT_PUBLIC_SERVER_URL=$NEXT_PUBLIC_SERVER_URL GIT_SHA=$GIT_SHA
 
 # Payload CMS and some ORMs touch the database during `next build`. Pass it as a BuildKit secret so it never
 # lands in an image layer. Harmless if the secret is not provided.
+# Yarn projects build with `npm run build`: Yarn 2+ refuses `yarn build` here because its install state
+# stayed in the deps stage (only node_modules is copied).
 RUN --mount=type=secret,id=DATABASE_URL,env=DATABASE_URL \
     NODE_OPTIONS=--max-old-space-size=4096 \
-    sh -c 'if [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm build; \
-           elif [ -f yarn.lock ]; then corepack enable yarn && yarn build; \
-           else npm run build; fi'
+    sh -c 'if [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm build; else npm run build; fi'
 
 # ---------- tools: migrations and one-off commands (NOT the final stage) ----------
 # Full node_modules (dev deps included: drizzle-kit, prisma CLI, payload CLI, tsx) + the whole source
