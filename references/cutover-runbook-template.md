@@ -54,6 +54,8 @@ Rollback decision deadline: flip + <60> min. Status channel: <link>.
 - [ ] Freeze schema migrations; confirm the last migration is applied on both sides.
 - [ ] Pause Railway/Vercel crons that write (or confirm they are idempotent).
 - [ ] Write new `app_rw` password into the app secret; `put_secrets.sh --diff` shows only expected keys.
+- [ ] *(Breach mode only)* `breach_check.sh --verify migration/.secrets/railway.burned.sha256` exits 0 and
+      every BREACH.md "rotate now" row is ticked. Session-secret rotation steps for T+15 are written out.
 - [ ] Announce the window.
 
 ## 4. Cutover sequence
@@ -66,6 +68,9 @@ T+02  Confirm no writers on Railway:
 T+03  Final dump:    SRC_URL=... scripts/pg_migrate.sh dump
 T+08  Restore:       TGT_URL=... scripts/pg_migrate.sh restore --target-db app --role app_owner --clean
 T+15  Verify:        scripts/pg_migrate.sh verify --target-db app   (counts + checksums + sequences OK)
+      (Breach mode only) Rotate session/auth secrets now, while no traffic flows: new value in the app
+      secret, re-key encrypted data per references/breach-response.md section 5, delete sessions, remove
+      any "previous secrets" entry holding the leaked value, force a new ECS deployment.
       Blob/bucket incremental copy (idempotent script). URL rewrite SQL for stored file URLs.
 T+18  Smoke test AWS on its own hostname (MAINTENANCE_MODE is not set there): login, write, upload,
       webhook replay (Stripe "resend"), health endpoint, one cron RunTask.
@@ -94,8 +99,11 @@ apply it to Railway. After the decision deadline, rollback is no longer on the t
 - Day 1-2: **rotate** what was exported or dual-registered: RDS app-user password, old webhook
   endpoints and secrets deleted, `BLOB_READ_WRITE_TOKEN`, any API key that lived in Vercel/Railway env.
   Schedule the `PAYLOAD_SECRET`/`AUTH_SECRET` rotation with a user re-login notice.
+  *(Breach mode: these already rotated before or during cutover; skip this item.)*
 - Day 7: remove old OAuth redirect URIs; delete the Railway TCP proxy (Public Access); scale old
   services to 0 / sleep (keep volumes).
+- *(Breach mode)* Before scaling Railway down: run `breach_check.sh --verify` once more, then shred
+  `migration/.secrets/railway.burned.sha256` with the other `.secrets/` files.
 - Day 7-14: last `pg_dump` of Railway to S3 (encrypted, Glacier); delete Railway services/volumes,
   Vercel project and Blob store; shred local dumps and `migration/.secrets/`; drop `app_rehearsal`.
 - Confirm in Cost Explorer that the project's tag shows the expected line items and that Railway/Vercel
