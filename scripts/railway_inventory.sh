@@ -70,18 +70,9 @@ OUT="$(cd "$OUT" && pwd)"
 SECRETS_DIR="$(cd "$SECRETS_DIR" && pwd)"
 
 # .gitignore: add the secrets dir at the repo root (or cwd if not a git repo)
-add_gitignore() {
-  local root entry
-  root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-  entry="$SECRETS_DIR"
-  case "$entry" in /*) entry="${entry#"$root"/}" ;; esac
-  entry="${entry%/}/"
-  if ! grep -qxF -- "$entry" "$root/.gitignore" 2>/dev/null; then
-    printf '%s\n' "$entry" >>"$root/.gitignore"
-    echo "gitignore: added '$entry' to $root/.gitignore"
-  fi
-}
-add_gitignore
+# shellcheck source=lib/gitignore.sh
+. "$SCRIPT_DIR/lib/gitignore.sh"
+gitignore_add_dir "$SECRETS_DIR"
 
 ERRLOG="$OUT/errors.log"
 : >"$ERRLOG"

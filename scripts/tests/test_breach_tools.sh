@@ -105,6 +105,15 @@ mkdir -p nested/migration
 rc=0; (cd nested && "$SH" "$SCRIPTS/breach_check.sh" --out migration/BREACH-CHECK.md >../nested.out 2>&1) || rc=$?
 check "--out in a subdirectory works (paths survive the cd into the link dir)" '[ "$rc" -eq 0 ] && grep -q "0 unreadable" nested.out && grep -q "OPENAI_API_KEY" nested/migration/BREACH-CHECK.md'
 
+if command -v git >/dev/null 2>&1; then
+  mkdir -p repo && (cd repo && git init -q . && "$SH" "$SCRIPTS/breach_check.sh" --out migration/BREACH-CHECK.md \
+    --fingerprint migration/.secrets/railway.burned.sha256 >/dev/null 2>&1) || true
+  check "fingerprint dir is added to the repo's .gitignore" 'grep -qxF "migration/.secrets/" repo/.gitignore'
+  check "git does not see the fingerprint file" '[ -z "$(cd repo && git status --porcelain --untracked-files=all | grep "railway.burned")" ]'
+else
+  echo "  skip  .gitignore checks (git not installed)"
+fi
+
 FAKE_NO_VARIABLE_SUBCMD=1 "$SH" "$SCRIPTS/breach_check.sh" --out fallback.md >/dev/null 2>&1 || true
 check "falls back to \`railway variables\` on older CLIs" 'grep -q "OPENAI_API_KEY" fallback.md'
 

@@ -16,6 +16,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/fingerprint.sh
 . "$SCRIPT_DIR/lib/fingerprint.sh"
+# shellcheck source=lib/gitignore.sh
+. "$SCRIPT_DIR/lib/gitignore.sh"
 
 OUT="railway-exposure.md"
 FINGERPRINT=""
@@ -214,6 +216,7 @@ fi
 # ---------------------------------------------------------------- fingerprint file
 if [ -n "$FINGERPRINT" ]; then
   mkdir -p "$(dirname "$FINGERPRINT")"
+  gitignore_add_dir "$(dirname "$FINGERPRINT")"
   sort -u "$FP_NEW" >"$FINGERPRINT"
   chmod 600 "$FINGERPRINT" 2>/dev/null || true
 fi
