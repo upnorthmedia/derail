@@ -1,6 +1,6 @@
 # Migration scripts
 
-Helper scripts bundled with the `railway-to-aws` skill. They inventory a Railway and/or Vercel
+Helper scripts bundled with the `derail` skill. They inventory a Railway and/or Vercel
 deployment, scan the codebase, move the Postgres database and file storage, load runtime secrets
 into AWS Secrets Manager, and estimate the AWS bill. Terraform lives in `../assets/terraform`; these
 scripts do the discovery and data movement around it.
