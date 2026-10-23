@@ -26,7 +26,7 @@ Checks:
   jq                                 HARD (WARN with --no-aws / --offline)
   docker + buildx                    warn
   pg_dump / pg_restore / psql        warn (warn if major < --pg-major)
-  railway CLI + `railway whoami`     warn (skip with --no-railway)
+  railway CLI (>= 5.27.0) + whoami   warn (skip with --no-railway)
   vercel  CLI + `vercel whoami`      warn (skip with --no-vercel)
   node (>= 20), git                  warn
 
@@ -157,9 +157,27 @@ for tool in pg_dump pg_restore psql; do
 done
 
 # ---- railway CLI -------------------------------------------------------
+# Minimum versions, from the CLI release notes: tcp-proxy in v5.15.0, connect --tunnel-only in v5.27.0.
+RAILWAY_MIN="5.27.0"
+RAILWAY_TCP_PROXY_MIN="5.15.0"
 if [ "$WANT_RAILWAY" -eq 1 ]; then
   if have railway; then
-    r_ver="$(railway --version 2>/dev/null | head -n1 | sed -E 's/^[^0-9]*//' || true)"
+    # `railway --version` prints e.g. "railway 4.16.1". The raw line is untrusted: keep printable
+    # characters only, drop the table separator, cap the length.
+    r_raw="$(railway --version 2>/dev/null | head -n1 | LC_ALL=C tr -cd '[:print:]' | tr -d '|' | cut -c1-80 || true)"
+    r_ver="$(printf '%s\n' "$r_raw" | sed -nE 's/^[^0-9]*([0-9]{1,6}\.[0-9]{1,6}(\.[0-9]{1,6})?)([^0-9].*)?$/\1/p' | head -n1)"
+    if [ -z "$r_ver" ]; then
+      row WARN "railway version" "unrecognized version output '${r_raw:-<empty>}'; need >= $RAILWAY_MIN for railway connect --tunnel-only"
+    elif ! version_ge "$r_ver" "$RAILWAY_MIN"; then
+      missing="railway connect --tunnel-only (>= $RAILWAY_MIN)"
+      if ! version_ge "$r_ver" "$RAILWAY_TCP_PROXY_MIN"; then
+        missing="$missing, railway tcp-proxy (>= $RAILWAY_TCP_PROXY_MIN)"
+      fi
+      if [ "${r_ver%%.*}" -lt 5 ]; then
+        missing="$missing, the 5.x subcommands railway_inventory.sh uses (variable, bucket, config, postgres, usage, cron)"
+      fi
+      row WARN "railway version" "v$r_ver < $RAILWAY_MIN: missing $missing. Upgrade: brew upgrade railway | npm update -g @railway/cli"
+    fi
     if railway whoami >/dev/null 2>&1; then
       row PASS "railway CLI" "v${r_ver:-?}, logged in"
     else
