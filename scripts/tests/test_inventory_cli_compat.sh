@@ -129,24 +129,25 @@ FIXTURE_VALUES="FIXTURE|sk-proj-"
 # `railway status --json` prints the `Project` GraphQL result as JSON (railwayapp/cli v4.16.1:
 # src/commands/status.rs, src/gql/queries/strings/Project.graphql; 5.71.0 adds instance fields).
 # `services` is project-wide; the services of one environment are its serviceInstances. `worker`
-# exists only in staging, so a production inventory must not pick it up.
+# exists only in staging, so a production inventory must not pick it up. Staging is listed first and
+# its `web` has other settings, so the summary must read only the production instance.
 cat >"$T/fixture/status.json" <<'EOF'
 {"id":"p1","name":"shop","deletedAt":null,"workspace":{"name":"Acme"},
  "environments":{"edges":[
+  {"node":{"id":"e2","name":"staging","canAccess":true,"deletedAt":null,
+   "serviceInstances":{"edges":[
+     {"node":{"id":"si2","serviceId":"s1","serviceName":"web","environmentId":"e2","latestDeployment":null,
+       "source":{"repo":"acme/web-preview","image":null},"domains":{"serviceDomains":[],"customDomains":[]},
+       "cronSchedule":"*/10 * * * *","nextCronRunAt":null,"startCommand":"npm run dev"}},
+     {"node":{"id":"si3","serviceId":"s2","serviceName":"worker","environmentId":"e2","latestDeployment":null,
+       "source":{"repo":"acme/worker","image":null},"domains":{"serviceDomains":[],"customDomains":[]},
+       "cronSchedule":"*/5 * * * *","nextCronRunAt":null,"startCommand":null}}]},
+   "volumeInstances":{"edges":[]}}},
   {"node":{"id":"e1","name":"production","canAccess":true,"deletedAt":null,
    "serviceInstances":{"edges":[{"node":{"id":"si1","serviceId":"s1","serviceName":"web","environmentId":"e1",
      "latestDeployment":null,"source":{"repo":"acme/web","image":null},
      "domains":{"serviceDomains":[{"id":"d1","domain":"web-production.up.railway.app","targetPort":8080}],"customDomains":[]},
      "cronSchedule":null,"nextCronRunAt":null,"startCommand":"node server.js"}}]},
-   "volumeInstances":{"edges":[]}}},
-  {"node":{"id":"e2","name":"staging","canAccess":true,"deletedAt":null,
-   "serviceInstances":{"edges":[
-     {"node":{"id":"si2","serviceId":"s1","serviceName":"web","environmentId":"e2","latestDeployment":null,
-       "source":{"repo":"acme/web","image":null},"domains":{"serviceDomains":[],"customDomains":[]},
-       "cronSchedule":null,"nextCronRunAt":null,"startCommand":"node server.js"}},
-     {"node":{"id":"si3","serviceId":"s2","serviceName":"worker","environmentId":"e2","latestDeployment":null,
-       "source":{"repo":"acme/worker","image":null},"domains":{"serviceDomains":[],"customDomains":[]},
-       "cronSchedule":"*/5 * * * *","nextCronRunAt":null,"startCommand":null}}]},
    "volumeInstances":{"edges":[]}}}]},
  "services":{"edges":[{"node":{"id":"s1","name":"web"}},{"node":{"id":"s2","name":"worker"}}]}}
 EOF
@@ -224,6 +225,20 @@ check "nothing skipped" '! grep "skipped: not in this CLI" $E >/dev/null'
 check "no deprecated \`service status --all\` call (\`service list --json\` has its data)" '! grep -E "^service status" $L >/dev/null'
 check "summary uses \`service list --json\` (regions)" 'jq -e ".services[] | select(.name==\"web\") | .regions | tostring | test(\"us-west2\")" guard_new/$INV/services.normalized.json >/dev/null'
 check "summary uses \`service list --json\` (replicas, not legacy numReplicas)" 'jq -e ".services[] | select(.name==\"web\") | .replicas.configured == 2" guard_new/$INV/services.normalized.json >/dev/null 2>&1'
+
+echo "== summary reads only the target environment from status --json"
+for r in guard_old guard_new; do
+  W=".services[] | select(.name==\"web\")"
+  check "$r: start command from production" 'jq -e "$W | .start_command == \"node server.js\"" $r/$INV/services.normalized.json >/dev/null 2>&1'
+  check "$r: source from production" 'jq -e "$W | .source == \"acme/web\"" $r/$INV/services.normalized.json >/dev/null 2>&1'
+  check "$r: no cron from staging" 'jq -e "$W | .cron == \"?\"" $r/$INV/services.normalized.json >/dev/null 2>&1'
+  check "$r: domains from production" 'jq -e "$W | .domains | tostring | test(\"web-production\")" $r/$INV/services.normalized.json >/dev/null 2>&1'
+done
+mkdir envid envmissing
+(cd envid && env FAKE_CLI=old "$SH" "$SCRIPTS/railway_inventory.sh" --project p1 --environment e1 >inv.out 2>&1) || true
+(cd envmissing && env FAKE_CLI=old "$SH" "$SCRIPTS/railway_inventory.sh" --project p1 --environment preview >inv.out 2>&1) || true
+check "an environment ID selects that environment" 'jq -e "$W | .start_command == \"node server.js\"" envid/$INV/services.normalized.json >/dev/null 2>&1'
+check "an environment missing from status --json keeps the data" 'jq -e "$W | .start_command != \"?\"" envmissing/$INV/services.normalized.json >/dev/null 2>&1'
 
 echo "== re-run with an older CLI in the same directory"
 mkdir rerun
