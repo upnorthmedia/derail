@@ -33,15 +33,17 @@ or leaked some other way. An ordinary migration never loads this file, and none 
    `scripts/breach_check.sh --project <name> --fingerprint migration/.secrets/railway.burned.sha256 --out migration/BREACH-CHECK.md`.
    This must run before anyone rotates anything. A fingerprint of an already-rotated value protects
    nothing, so ask the user whether rotation has started; if it has, fingerprint anyway, and say that keys
-   rotated before this point are covered only by the user's own record.
+   rotated before this point are covered only by the user's own record. The script refuses to overwrite an
+   existing fingerprint file (exit 2): that file is the record of the exposed values, so keep it.
    No CLI access (the eval and offline cases): build BREACH.md from the inventory's names and say plainly
    that the exposed-value guard is not active.
 2. **Write `migration/BREACH.md`** (section 3). Names only, like every other file.
 3. **The user rotates on Railway**, in BREACH.md order, using section 4 to avoid taking production down.
    This is incident response and comes before the migration timeline, not inside it.
 4. **Prove it**: `scripts/breach_check.sh --project <name> --verify migration/.secrets/railway.burned.sha256`.
-   Exit 0 means no variable on Railway still holds an exposed value. Sealed variables are invisible to
-   the CLI; the user confirms those by hand.
+   Exit 0 means no variable on Railway still holds an exposed value. Exit 3 means none was found but some
+   services could not be read: not a pass, fix the read and re-run. Sealed variables are invisible to the
+   CLI; the user confirms those by hand.
 5. **Migrate with fresh values.** The AWS env file is filled from the rotated values. `put_secrets.sh`
    finds the fingerprint file next to the env file and refuses any match by key name. Use
    `--allow-carryover KEY` only for a value the user confirms is not a secret.

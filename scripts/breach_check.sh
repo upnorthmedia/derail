@@ -8,7 +8,8 @@
 #   --fingerprint FILE  also record a fingerprint (sha256, see lib/fingerprint.sh) of every current
 #                       value. Run this BEFORE rotating anything: it is the record of what was exposed.
 #   --verify FILE       re-read Railway and list every variable that still holds a value from FILE,
-#                       i.e. was not rotated yet. Exit 1 if any remain.
+#                       i.e. was not rotated yet. Exit 1 if any remain, 3 if none were found but some
+#                       services could not be read (the check is incomplete).
 #
 # Values are read into a umask 077 temp dir, classified and fingerprinted, then deleted. They are
 # never printed, never written to the checklist, and never passed as arguments.
@@ -41,7 +42,8 @@ Default: every project from `railway list --json`, every environment, every serv
                   `put_secrets.sh` refuses any value whose fingerprint is in this file, and
                   `--verify` uses it to prove rotation is complete.
   --verify        compare current values against a fingerprint file; lists variables that still
-                  hold an exposed value. Exit 1 if any do.
+                  hold an exposed value. Exit 1 if any do; exit 3 if none do but some services could
+                  not be read, so the check is incomplete.
 
 Output never contains a value. Sealed variables cannot be read by the CLI, so they are not listed:
 check each service in the Railway dashboard for sealed variables and rotate those too.
@@ -76,6 +78,9 @@ if ! railway whoami >/dev/null 2>&1; then
   echo "error: railway CLI is not logged in (railway login, or set RAILWAY_API_TOKEN)" >&2; exit 1
 fi
 
+# Private from the first mkdir: --fingerprint's directory also receives the exported env files later.
+umask 077
+
 # Absolute paths: the Railway CLI runs from a temp link dir, and redirections inside that subshell
 # resolve relative paths against it.
 abspath() { mkdir -p "$(dirname "$1")" && printf '%s/%s\n' "$(cd "$(dirname "$1")" && pwd)" "$(basename "$1")"; }
@@ -85,8 +90,14 @@ OUT="$(abspath "$OUT")"
 if [ -n "$FINGERPRINT" ] && [ -n "$VERIFY" ]; then
   [ "$FINGERPRINT" != "$VERIFY" ] || { echo "error: --fingerprint and --verify must be different files" >&2; exit 2; }
 fi
+# The fingerprint file is the record of the exposed values. Re-running after rotation has started would
+# mix in new values, so never replace it: moving it aside has to be deliberate.
+if [ -n "$FINGERPRINT" ] && [ -s "$FINGERPRINT" ]; then
+  echo "error: fingerprint file '$FINGERPRINT' already exists. It records the exposed values; to check" >&2
+  echo "       rotation use --verify with it. To start over on purpose, move it aside first." >&2
+  exit 2
+fi
 
-umask 077
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 ERRLOG="${OUT%.md}.errors.log"
@@ -336,6 +347,10 @@ if [ -n "$VERIFY" ]; then
   if [ "$still" -gt 0 ]; then
     echo "verify: $still variable(s) still hold an exposed value (listed in $OUT)"
     exit 1
+  fi
+  if [ "$FAILED" -gt 0 ]; then
+    echo "verify: incomplete, $FAILED service(s) could not be read (see $ERRLOG); fix that and re-run"
+    exit 3
   fi
   echo "verify: no variable holds a fingerprinted value"
 fi
