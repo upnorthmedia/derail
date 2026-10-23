@@ -13,7 +13,9 @@
 #   dump       pg_dump -Fd -jN --compress=zstd --no-owner --no-privileges ... + counts/checksums
 #   restore    create DB + extensions, pg_restore -jN --no-owner --no-privileges --no-comments
 #              [--role], ANALYZE, counts/checksums diff -> OK / MISMATCH. Skips the dump's event
-#              triggers and user mappings unless --keep-event-triggers / --keep-user-mappings
+#              triggers and user mappings unless --keep-event-triggers / --keep-user-mappings. With
+#              --role and foreign servers in the dump, grants the role USAGE on their wrappers for the
+#              pg_restore only
 #   verify     re-run counts/checksums on both sides and diff
 #   roles      render sql/app_roles.sql.tpl and apply (passwords via APP_RW_PASSWORD /
 #              APP_MIGRATE_PASSWORD env, read inside psql with \getenv; never echoed)
@@ -53,7 +55,9 @@ Options:
   --jobs N           parallel jobs for pg_dump/pg_restore (default 4)
   --target-db NAME   application database on the target (default: db name from SRC_URL, else "app")
   --role ROLE        pg_restore --role (objects owned by this role; e.g. app_owner). Requires
-                     the role to exist and the master user to be a member (see `roles`).
+                     the role to exist and the master user to be a member (see `roles`). If the dump has
+                     foreign servers, restore grants the role USAGE on the foreign-data wrappers for the
+                     pg_restore and revokes it afterwards.
   --dump-dir DIR     dump directory for restore/verify (default: <out>/LATEST pointer)
   --clean            restore with --clean --if-exists (re-runnable into a scratch DB)
   --no-exit-on-error restore without --exit-on-error (tolerate benign RDS errors)
@@ -185,6 +189,11 @@ else
   echo "   target : $(mask "$TGT_URL")  (app db: $TARGET_DB)"
 fi
 echo "   out    : $OUT   jobs: $JOBS   sslmode: $PGSSLMODE   dry-run: $DRY_RUN"
+# --out holds full production data (and any user-mapping password in the dump): keep it out of git, the
+# same way the inventory scripts keep their secrets dir out
+# shellcheck source=lib/gitignore.sh
+. "$SCRIPT_DIR/lib/gitignore.sh"
+[ "$DRY_RUN" -eq 1 ] || gitignore_add_dir "$OUT"
 
 major_of() { printf '%s' "$1" | sed -nE 's/^[^0-9]*([0-9]+).*/\1/p'; }
 pg_dump_major() { major_of "$(pg_dump --version | sed -nE 's/.* ([0-9]+)(\.[0-9]+)?.*/\1/p')"; }
@@ -314,6 +323,45 @@ resolve_dump_dir() {
   fi
 }
 
+# fdw_grant / fdw_revoke: a foreign server in the dump needs USAGE on its foreign-data wrapper, which the
+# master created in restore step 2 and --role lacks ("permission denied for foreign-data wrapper"). Grant
+# it only on wrappers the role lacks it on (so a grant made by someone else is never revoked), for the
+# pg_restore only; fdw_revoke takes exactly those back, also on failure (EXIT trap). The privilege is
+# read back after each GRANT/REVOKE: one run by a role that holds USAGE without the grant option only
+# warns ("no privileges were granted") and exits 0.
+FDW_GRANTED=""
+fdw_usage() { pq_at "$APP_URL" -c "SELECT has_foreign_data_wrapper_privilege('$ROLE', '$1', 'USAGE')"; }
+fdw_grant() {
+  local fdws f
+  fdws="$(pq_at "$APP_URL" -c "SELECT fdwname FROM pg_foreign_data_wrapper WHERE NOT has_foreign_data_wrapper_privilege('$ROLE', oid, 'USAGE') ORDER BY 1")"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    pq "$APP_URL" -c "GRANT USAGE ON FOREIGN DATA WRAPPER \"$f\" TO \"$ROLE\"" || true
+    if [ "$(fdw_usage "$f")" = "t" ]; then
+      FDW_GRANTED="$FDW_GRANTED$f"$'\n'
+      log "granted USAGE on foreign-data wrapper $f to $ROLE for this restore (the dump has foreign servers)"
+    else
+      log "WARN: could not grant USAGE on foreign-data wrapper $f to $ROLE, so pg_restore will fail on its servers."
+      log "      Fallback: restore without --role (the restored objects are then owned by the master user)."
+    fi
+  done <<<"$fdws"
+  if [ -n "$FDW_GRANTED" ]; then trap fdw_revoke EXIT; fi
+}
+fdw_revoke() {
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    pq "$APP_URL" -c "REVOKE USAGE ON FOREIGN DATA WRAPPER \"$f\" FROM \"$ROLE\"" || true
+    if [ "$(fdw_usage "$f")" = "f" ]; then
+      log "revoked USAGE on foreign-data wrapper $f from $ROLE"
+    else
+      log "WARN: could not revoke USAGE on foreign-data wrapper $f from $ROLE; run it as the master user."
+    fi
+  done <<<"$FDW_GRANTED"
+  FDW_GRANTED=""
+  trap - EXIT
+}
+
 # ---------------------------------------------------------------- restore
 do_restore() {
   resolve_dump_dir
@@ -419,8 +467,12 @@ do_restore() {
       mv "$toc.filtered.tmp" "$toc.filtered"
     fi
     args+=(--use-list="$toc.filtered")
+    if [ -n "$ROLE" ] && grep -qE '^[0-9]+; [0-9]+ [0-9]+ SERVER - ' "$toc.filtered"; then fdw_grant; fi
   else
     echo "  (would skip EVENT TRIGGER / USER MAPPING entries in the dump unless --keep-event-triggers / --keep-user-mappings)"
+    if [ -n "$ROLE" ]; then
+      echo "  (if the dump has foreign servers: would GRANT USAGE ON FOREIGN DATA WRAPPER to $ROLE for the pg_restore, then REVOKE it)"
+    fi
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
     run_cmd pg_restore "${args[@]}" --use-list="$OUT/toc-<stamp>.list.filtered" "$DUMP_DIR/data"
@@ -438,6 +490,7 @@ do_restore() {
       exit 1
     fi
     log "pg_restore ok (log: $logf, $(grep -c 'pg_restore:' "$logf" || true) lines)"
+    if [ -n "$FDW_GRANTED" ]; then fdw_revoke; fi
   fi
 
   # 4. post: ANALYZE, verify
