@@ -27,10 +27,14 @@ Runs (all best-effort, errors -> <out>/errors.log):
   railway link --project ... --environment ...
   railway status --json, environment config --json, service list --json (text fallback),
   domain list --json, volume list --json, bucket list --json,
-  per service: variable list --json  (VALUES -> <secrets-dir>/railway.<service>.env, umask 077;
+  per service: variable list --json  (--kv fallback, then `variables` on older CLIs;
+                                      VALUES -> <secrets-dir>/railway.<service>.env, umask 077;
                                       NAMES + classification -> <out>/variables/<service>.json)
   railway config pull --force (in a temp dir; copies .railway/railway.ts + functions/)
   railway postgres ha|pgbouncer|pitr status --json, railway usage projects --json
+
+Subcommands this CLI version does not list in `railway <cmd> --help` are skipped, not run (older
+CLIs read an unknown subcommand as an argument, e.g. 4.16.1 takes `domain list` as "add domain list").
 
 Writes <out>/SUMMARY.md with a services table and variable names by class.
 
@@ -68,6 +72,8 @@ chmod 700 "$SECRETS_DIR" 2>/dev/null || true
 # absolute paths: later steps cd into a temp dir for `railway config pull`
 OUT="$(cd "$OUT" && pwd)"
 SECRETS_DIR="$(cd "$SECRETS_DIR" && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
 
 # .gitignore: add the secrets dir at the repo root (or cwd if not a git repo)
 # shellcheck source=lib/gitignore.sh
@@ -107,6 +113,47 @@ run() {
 
 is_json() { jq -e . "$1" >/dev/null 2>&1; }
 
+# Older CLIs read an unknown subcommand as an argument: 4.16.1 takes `railway domain list --json` as
+# "add custom domain list" and `railway service list` as "link service list". So a subcommand runs only
+# if each of its words is listed under "Commands:" in its parent's --help. Help is read once per command.
+HELP_CACHE="$TMP/help"
+mkdir -p "$HELP_CACHE"
+# subcommands_of [word...]: prints the path of a file listing the subcommands of `railway word...`
+subcommands_of() {
+  local f
+  f="$HELP_CACHE/cmd_$(printf '%s' "$*" | tr -c 'A-Za-z0-9' '_')"
+  if [ ! -f "$f" ]; then
+    railway "$@" --help </dev/null >"$f.help" 2>/dev/null || true
+    awk '/^Commands:/ {on = 1; next} /^[^ ]/ {on = 0} on && NF {print $1}' "$f.help" >"$f"
+  fi
+  printf '%s\n' "$f"
+}
+HELP_CHECKS=1
+if [ ! -s "$(subcommands_of)" ]; then
+  # Not a CLI whose help we can read (or a stand-in): run everything as before.
+  HELP_CHECKS=0
+  echo "## [subcommand checks] disabled: no command list in \`railway --help\`" >>"$ERRLOG"
+fi
+# has_subcmd word...: true if `railway word...` is a subcommand this CLI has
+has_subcmd() {
+  [ "$HELP_CHECKS" -eq 1 ] || return 0
+  local parent=() w
+  for w in "$@"; do
+    grep -qxF -- "$w" "$(subcommands_of ${parent[@]+"${parent[@]}"})" || return 1
+    parent+=("$w")
+  done
+}
+skipped() {
+  echo "## [$1] skipped: not in this CLI" >>"$ERRLOG"
+  printf '  %-28s skipped (not in this CLI)\n' "$1"
+}
+# run_if "<cmd> <sub>..." <label> <outfile> -- cmd args...   run(), only if this CLI has that subcommand
+run_if() {
+  local words="$1"; shift
+  # shellcheck disable=SC2086  # $words is a space-separated subcommand path
+  if has_subcmd $words; then run "$@"; else skipped "$1"; return 1; fi
+}
+
 echo "== Railway inventory: project=$PROJECT environment=$ENVIRONMENT -> $OUT"
 
 # ---------------------------------------------------------------- link
@@ -116,17 +163,17 @@ fi
 
 # ---------------------------------------------------------------- project-level exports
 run "status --json" "$OUT/raw/status.json" -- railway status --json || true
-run "environment config --json" "$OUT/raw/environment-config.json" -- railway environment config --json || true
-if ! run "service list --json" "$OUT/raw/services.json" -- railway service list --json || ! is_json "$OUT/raw/services.json"; then
-  run "service list (text)" "$OUT/raw/services.txt" -- railway service list || true
+run_if "environment config" "environment config --json" "$OUT/raw/environment-config.json" -- railway environment config --json || true
+if ! run_if "service list" "service list --json" "$OUT/raw/services.json" -- railway service list --json || ! is_json "$OUT/raw/services.json"; then
+  run_if "service list" "service list (text)" "$OUT/raw/services.txt" -- railway service list || true
 fi
-run "domain list --json" "$OUT/raw/domains.json" -- railway domain list --json || true
-run "volume list --json" "$OUT/raw/volumes.json" -- railway volume list --json || true
-run "bucket list --json" "$OUT/raw/buckets.json" -- railway bucket list --json || true
-run "service status --all --json" "$OUT/raw/service-status.json" -- railway service status --all --json || true
-run "cron list" "$OUT/raw/crons.txt" -- railway cron list || true
-run "functions list" "$OUT/raw/functions.txt" -- railway functions list || true
-run "environment list" "$OUT/raw/environments.txt" -- railway environment list || true
+run_if "domain list" "domain list --json" "$OUT/raw/domains.json" -- railway domain list --json || true
+run_if "volume list" "volume list --json" "$OUT/raw/volumes.json" -- railway volume list --json || true
+run_if "bucket list" "bucket list --json" "$OUT/raw/buckets.json" -- railway bucket list --json || true
+run_if "service status" "service status --all --json" "$OUT/raw/service-status.json" -- railway service status --all --json || true
+run_if "cron list" "cron list" "$OUT/raw/crons.txt" -- railway cron list || true
+run_if "functions list" "functions list" "$OUT/raw/functions.txt" -- railway functions list || true
+run_if "environment list" "environment list" "$OUT/raw/environments.txt" -- railway environment list || true
 
 # ---------------------------------------------------------------- service names
 # Try several JSON shapes, then the text output, then status.json.
@@ -159,15 +206,17 @@ echo "services discovered: ${#SERVICES[@]}"
 
 # ---------------------------------------------------------------- config pull (railway.ts)
 # Done in a temp dir so the user's repo is not touched. No --include-variables: values stay out.
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-(
-  cd "$TMP" || exit 1
-  if [ "$SKIP_LINK" -eq 0 ]; then
-    railway link --project "$PROJECT" --environment "$ENVIRONMENT" >/dev/null 2>>"$ERRLOG" || true
-  fi
-  railway config pull --force >"$TMP/config-pull.out" 2>>"$ERRLOG" || echo "## [config pull] failed" >>"$ERRLOG"
-) || true
+if has_subcmd config pull; then
+  (
+    cd "$TMP" || exit 1
+    if [ "$SKIP_LINK" -eq 0 ]; then
+      railway link --project "$PROJECT" --environment "$ENVIRONMENT" >/dev/null 2>>"$ERRLOG" || true
+    fi
+    railway config pull --force >"$TMP/config-pull.out" 2>>"$ERRLOG" || echo "## [config pull] failed" >>"$ERRLOG"
+  ) || true
+else
+  skipped "config pull"
+fi
 if [ -f "$TMP/.railway/railway.ts" ]; then
   cp "$TMP/.railway/railway.ts" "$OUT/railway-config/railway.ts"
   [ -d "$TMP/.railway/functions" ] && cp -R "$TMP/.railway/functions" "$OUT/railway-config/"
@@ -205,19 +254,26 @@ classify_jq="$(cat "$SCRIPT_DIR/lib/classify_vars.jq")"
 for svc in "${SERVICES[@]}"; do
   safe="$(printf '%s' "$svc" | tr -c 'A-Za-z0-9._-' '_')"
   rawvars="$TMP/vars.$safe.json"      # values live only in TMP (mode 700) and SECRETS_DIR
-  rc=0
-  ( umask 077; railway variable list -s "$svc" -e "$ENVIRONMENT" --json >"$rawvars" 2>>"$ERRLOG" ) || rc=$?
-  if [ "$rc" -ne 0 ] || ! is_json "$rawvars"; then
-    # fallback: --kv (KEY=VALUE lines) -> convert to JSON object
+  # Newer CLIs have `variable list`; 4.16.1 and older only have `variables`. Each is tried with
+  # --json, then --kv (KEY=VALUE lines, converted to a JSON object).
+  rc=0; got=0
+  for form in "variable list" "variables"; do
     rc=0
-    ( umask 077; railway variable list -s "$svc" -e "$ENVIRONMENT" --kv >"$TMP/vars.$safe.kv" 2>>"$ERRLOG" ) || rc=$?
+    # shellcheck disable=SC2086  # $form is one or two words on purpose
+    ( umask 077; railway $form -s "$svc" -e "$ENVIRONMENT" --json >"$rawvars" 2>>"$ERRLOG" ) || rc=$?
+    if [ "$rc" -eq 0 ] && is_json "$rawvars"; then got=1; break; fi
+    rc=0
+    # shellcheck disable=SC2086
+    ( umask 077; railway $form -s "$svc" -e "$ENVIRONMENT" --kv >"$TMP/vars.$safe.kv" 2>>"$ERRLOG" ) || rc=$?
     if [ "$rc" -eq 0 ] && [ -s "$TMP/vars.$safe.kv" ]; then
       ( umask 077; jq -Rn '[inputs | select(test("^[A-Za-z_][A-Za-z0-9_]*=")) | capture("^(?<key>[^=]+)=(?<value>.*)$")] | from_entries' "$TMP/vars.$safe.kv" >"$rawvars" )
-    else
-      echo "## [variable list -s $svc] failed (exit $rc)" >>"$ERRLOG"
-      printf '  variables: %-20s FAILED (see errors.log)\n' "$svc"
-      continue
+      got=1; break
     fi
+  done
+  if [ "$got" -eq 0 ]; then
+    echo "## [variable list -s $svc] failed (last exit $rc; tried variable list and variables, --json and --kv)" >>"$ERRLOG"
+    printf '  variables: %-20s FAILED (see errors.log)\n' "$svc"
+    continue
   fi
 
   # VALUES -> secrets dir (dotenv, JSON-escaped double-quoted values)
@@ -244,20 +300,20 @@ for svc in "${SERVICES[@]}"; do
   printf '  variables: %-20s %s vars (%s sealed/unavailable) -> %s/railway.%s.env\n' "$svc" "$n" "$sealed" "$SECRETS_DIR" "$safe"
 
   # per-service domain list (some CLI versions scope domains to the linked service)
-  run "domain list -s $svc" "$OUT/raw/domains.$safe.json" -- railway domain list -s "$svc" --json >/dev/null 2>&1 || true
+  run_if "domain list" "domain list -s $svc" "$OUT/raw/domains.$safe.json" -- railway domain list -s "$svc" --json >/dev/null 2>&1 || true
 done
 
 # ---------------------------------------------------------------- postgres add-ons, usage
-run "postgres ha status" "$OUT/raw/postgres-ha.json" -- railway postgres ha status --json || true
-run "postgres pgbouncer status" "$OUT/raw/postgres-pgbouncer.json" -- railway postgres pgbouncer status --json || true
-run "postgres pitr status" "$OUT/raw/postgres-pitr.json" -- railway postgres pitr status --json || true
+run_if "postgres ha status" "postgres ha status" "$OUT/raw/postgres-ha.json" -- railway postgres ha status --json || true
+run_if "postgres pgbouncer status" "postgres pgbouncer status" "$OUT/raw/postgres-pgbouncer.json" -- railway postgres pgbouncer status --json || true
+run_if "postgres pitr status" "postgres pitr status" "$OUT/raw/postgres-pitr.json" -- railway postgres pitr status --json || true
 
 PROJECT_NAME="$PROJECT"
 if is_json "$OUT/raw/status.json"; then
   PROJECT_NAME="$(jq -r '.name // .project.name // .projectName // empty' "$OUT/raw/status.json" 2>/dev/null || true)"
   PROJECT_NAME="${PROJECT_NAME:-$PROJECT}"
 fi
-run "usage projects" "$OUT/raw/usage.json" -- railway usage projects --project "$PROJECT_NAME" --json || true
+run_if "usage projects" "usage projects" "$OUT/raw/usage.json" -- railway usage projects --project "$PROJECT_NAME" --json || true
 
 # ---------------------------------------------------------------- normalized services + SUMMARY.md
 # Heuristic merge of status.json / environment-config.json / service-status.json / railway.ts.
@@ -384,6 +440,7 @@ jq -s 'map({(.service): {count, by_class, sealed_unavailable, names_by_class: (.
   echo "5. Run \`scan_codebase.py\` on the repo and \`estimate_cost.py\` with the replica/size numbers above."
 } >"$OUT/SUMMARY.md"
 
-errs="$(grep -c '^## \[' "$ERRLOG" || true)"
+errs="$(grep '^## \[' "$ERRLOG" | grep -vc 'skipped: not in this CLI$' || true)"
+skips="$(grep -c '^## \[.*skipped: not in this CLI$' "$ERRLOG" || true)"
 echo
-echo "done: $OUT/SUMMARY.md  (services=${#SERVICES[@]}, command errors logged=$errs)"
+echo "done: $OUT/SUMMARY.md  (services=${#SERVICES[@]}, command errors logged=$errs, skipped (not in this CLI)=$skips)"
