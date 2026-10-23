@@ -57,14 +57,16 @@ write_web() {
 {"OPENAI_API_KEY":"$1","STRIPE_SECRET_KEY":"sk_live_FIXTUREstripe000000001","STRIPE_WEBHOOK_SECRET":"whsec_FIXTUREwebhook00000001",
  "BETTER_AUTH_SECRET":"FIXTUREauthsecret0000000000000001","GITHUB_TOKEN":"ghp_FIXTUREgithub00000000000001",
  "DATABASE_URL":"\${{Postgres.DATABASE_URL}}","LOG_LEVEL":"info","NEXT_PUBLIC_SITE_URL":"https://shop.example",
- "RAILWAY_PUBLIC_DOMAIN":"web-production.up.railway.app","POSTMARK_SERVER_TOKEN":"$2"}
+ "RAILWAY_PUBLIC_DOMAIN":"web-production.up.railway.app","POSTMARK_SERVER_TOKEN":"$2",
+ "AWS_REGION":"us-east-1","S3_BUCKET":"shop-uploads-prod","BETTER_AUTH_URL":"https://shop.example",
+ "GITHUB_CLIENT_ID":"Iv1.0123456789abcdef","SLACK_WEBHOOK_URL":"https://hooks.slack.com/services/FIXTUREslackhook0001"}
 EOF
 }
 write_web "sk-proj-FIXTUREopenai0000000000001" "FIXTUREpostmark00000000000001"
 cat >"$T/fixture/vars/Postgres.json" <<'EOF'
 {"DATABASE_URL":"postgresql://postgres:FIXTUREpgpass000000001@postgres.railway.internal:5432/railway",
  "DATABASE_PUBLIC_URL":"postgresql://postgres:FIXTUREpgpass000000001@proxy.rlwy.net:12345/railway",
- "PGPASSWORD":"FIXTUREpgpass000000001","PGPORT":"5432"}
+ "PGPASSWORD":"FIXTUREpgpass000000001","PGPORT":"5432","PGUSER":"postgres"}
 EOF
 FIXTURE_VALUES="FIXTURE|sk-proj-|sk_live_|whsec_|ghp_"
 
@@ -81,6 +83,9 @@ check "auth secret is a session secret" 'awk "/^## 6\\./,/^## 8\\./" exposure.md
 check "reference var points at its source" 'awk "/^## 9\\./,/^## Not covered/" exposure.md | grep >/dev/null "DATABASE_URL\` (shop/production/web)"'
 check "short config value is left out" '! grep -q "LOG_LEVEL" exposure.md'
 check "short database config (port) is left out" '! grep -q "PGPORT" exposure.md'
+check "well-known config names are left out" '! grep -Eq "AWS_REGION|S3_BUCKET|BETTER_AUTH_URL|GITHUB_CLIENT_ID|PGUSER" exposure.md'
+check "config is not fingerprinted" '! grep -Eq "/(AWS_REGION|S3_BUCKET|BETTER_AUTH_URL|GITHUB_CLIENT_ID|PGUSER)$" secrets/railway.burned.sha256'
+check "a webhook URL is still a secret" 'grep -q "SLACK_WEBHOOK_URL" exposure.md'
 check "public build-time var is left out" '! grep -q "NEXT_PUBLIC_SITE_URL" exposure.md'
 check "Railway-injected var is left out" '! grep -q "RAILWAY_PUBLIC_DOMAIN" exposure.md'
 check "fingerprint file is mode 600" '[ "$(stat -c %a secrets/railway.burned.sha256 2>/dev/null || stat -f %Lp secrets/railway.burned.sha256)" = "600" ]'
@@ -129,6 +134,10 @@ mkdir -p calm
 printf 'OPENAI_API_KEY=sk-proj-FIXTUREopenai0000000000001\n' >calm/aws.prod.env
 rc=0; put --env-file calm/aws.prod.env >p4.out 2>&1 || rc=$?
 check "no fingerprint file: ordinary migration is unaffected" '[ "$rc" -eq 0 ] && ! grep -q "exposed-value check" p4.out'
+
+printf 'S3_BUCKET=shop-uploads-prod\nAPP_ORIGIN=https://shop.example\n' >mig/config.env
+rc=0; put --env-file mig/config.env >p6.out 2>&1 || rc=$?
+check "config values that also lived on Railway pass the guard" '[ "$rc" -eq 0 ] && grep -q "exposed-value check: passed" p6.out'
 
 rc=0; put --env-file calm/aws.prod.env --burned-hashes mig/railway.burned.sha256 >p5.out 2>&1 || rc=$?
 check "explicit --burned-hashes is enforced" '[ "$rc" -eq 2 ] && grep -q "match fingerprints of exposed" p5.out'
