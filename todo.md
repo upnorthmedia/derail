@@ -1,0 +1,10 @@
+# TODO
+
+- [confirmed] 2026-10-22: Breach mode still leaves the Railway TCP proxy (public DB access) up until Day 7 post-cutover (`references/cutover-runbook-template.md` Day 7). In breach mode, keep it on only for dump windows and delete it at cutover. (I-06)
+- [confirmed] 2026-10-22: `pg_dump` carries any role-owned functions, triggers and SECURITY DEFINER code an intruder added into RDS; `pg_migrate.sh preflight` only lists roles and event triggers. Add a read-only `pg_migrate.sh audit` (login roles, SECURITY DEFINER functions, triggers, extensions, non-default schemas, live connections) writing `migration/inventory/db-audit.md` for sign-off. (I-05)
+- [investigate] 2026-10-22: Rotation sequencer: tag each BREACH.md row dual-key vs hard-cut so revoking never precedes deploying. Needs per-provider facts verified from docs, not guessed. (I-04)
+- [optimization] 2026-10-22: Pin base images by digest in `assets/docker/Dockerfile.*` and state "never pull existing private-registry images" as a rule when registry credentials were exposed. (I-07)
+- [investigate] 2026-10-22: Runbook step that plants a canary credential in the old Railway env between cutover and decommissioning, naming canary services as options rather than picking one. (I-09)
+- [confirmed] 2026-10-22: `railway_inventory.sh` calls only `railway variable list` (plus `--kv` on the same subcommand). Railway CLI 4.16.1 has `railway variables` and no `variable` subcommand, so every variable export fails on that version. `breach_check.sh` already falls back; the inventory should too.
+- [investigate] 2026-10-22: The new eval `evals/railway-breach-nextjs-ai` has not been run yet (`claude plugin eval . --case railway-breach-nextjs-ai --allow-tools Write,Edit,Bash --scaffold`). Run it with and without the skill and tune graders that are ambiguous.
+- [investigate] 2026-10-22: Session/auth secrets kept "identical through cutover" after the Railway breach. Addressed by breach mode on branch `readme-railway-breach-framing` (e9a2dc8); clear once merged.
