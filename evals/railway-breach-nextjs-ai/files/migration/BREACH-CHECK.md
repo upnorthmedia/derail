@@ -43,7 +43,7 @@ Roll the keys in the provider dashboard and review recent events, payouts and we
 
 ## 6. Session, signing and encryption secrets
 
-Anyone holding these can forge sessions or signatures. Rotating logs users out. If the library also encrypts stored data with it (Payload, Better Auth), re-encrypt with its rotation tooling, then remove the old value: keeping it as an accepted 'previous' secret keeps forged tokens valid.
+Anyone holding these can forge sessions or signatures. Rotating logs users out. If the library also encrypts stored data with it (Payload, Better Auth), re-encrypt that data (with the library's rotation tooling where it has one; Payload 3 has none), then remove the old value: keeping it as an accepted 'previous' secret keeps forged tokens valid.
 
 - [ ] `BETTER_AUTH_SECRET` (quillnote/production/web)
 
