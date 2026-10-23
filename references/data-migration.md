@@ -73,6 +73,11 @@ before a major version upgrade) and a user mapping carries another server's cred
 `--keep-event-triggers` (without `--role`) or `--keep-user-mappings` only for ones the db-audit report
 shows are yours.
 
+Everything `pg_migrate.sh` writes under `--out` (default `migration/db`: dumps, reports, TOC lists,
+`restore-<stamp>.log`) is created mode 600, with new directories 700. The dump holds every row and any
+user-mapping password in plain text, and a failed restore's log repeats the failing statement, which can
+include that password. Keep the directory out of git and shared drives.
+
 `dump` uses `--no-owner --no-privileges`, which drops ownership but not the objects themselves: every
 function, trigger, rule and foreign server in the source is restored (event triggers and user mappings only
 with the `--keep-*` flags above). `audit` lists them so a

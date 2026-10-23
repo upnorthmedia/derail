@@ -156,6 +156,10 @@ APP_URL="$(url_with_db "$TGT_URL" "$TARGET_DB")"
 MASTER_USER="$(printf '%s' "$TGT_URL" | sed -nE 's#^[a-z]+://([^:/@]+)(:[^@]*)?@.*#\1#p')"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
+# Everything this script and pg_dump write is private to the user (files 600, new directories 700): the
+# dump holds every row plus any user-mapping password in plain text, and a failed restore's log repeats
+# the failing statement. Files left by earlier runs keep their mode.
+umask 077
 mkdir -p "$OUT"
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
