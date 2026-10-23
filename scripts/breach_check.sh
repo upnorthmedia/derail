@@ -115,7 +115,7 @@ group_jq="$classify_jq"'
         elif $c == "bucket_credential" or ($k | test("^(AWS_|GCP_|GCLOUD_|GOOGLE_APPLICATION_CREDENTIALS|GOOGLE_CLOUD_|GOOGLE_SERVICE_ACCOUNT|AZURE_|CLOUDFLARE_|CF_API|R2_|DIGITALOCEAN_|DO_)")) then [2, "Cloud credentials", $k]
         elif $c == "database" then [3, "Databases and caches", $k]
         elif ($k | test("^(STRIPE|PADDLE|LEMONSQUEEZY|LEMON_SQUEEZY|PAYPAL|BRAINTREE|SQUARE|PLAID|ADYEN|RAZORPAY|POLAR)_")) then [4, "Payments", $k]
-        elif ($k | test("^(GITHUB_|GH_|GITLAB_|NPM_TOKEN|NPM_AUTH|NODE_AUTH_TOKEN|DOCKER|REGISTRY|GHCR|VERCEL_TOKEN|RAILWAY_(API_)?TOKEN$|SENTRY_AUTH_TOKEN|NETLIFY_AUTH_TOKEN)")) then [5, "Source, registry and deploy tokens", $k]
+        elif ($k | test("^(GITHUB|GH|GITLAB)_.*(TOKEN|PAT)$|^(GITHUB|GH)_PAT|^(NPM_TOKEN|NPM_AUTH|NODE_AUTH_TOKEN|DOCKER|REGISTRY|GHCR|VERCEL_TOKEN|SENTRY_AUTH_TOKEN|NETLIFY_AUTH_TOKEN)|^RAILWAY_(API_)?TOKEN$")) then [5, "Source, registry and deploy tokens", $k]
         elif ($k | test("WEBHOOK")) then [7, "Webhook secrets", $k]
         elif ($k | test("(AUTH|SESSION|JWT|COOKIE|ENCRYPTION|CRYPTO|PAYLOAD|SIGNING|HMAC|CSRF|SALT|PEPPER).*(SECRET|KEY|SALT|PEPPER)|^(PAYLOAD|AUTH|NEXTAUTH|BETTER_AUTH|SESSION|JWT|APP|SECRET_KEY_BASE|DJANGO)_?SECRET")) then [6, "Session, signing and encryption secrets", $k]
         else [8, "Other third-party keys and secrets (review)", $k] end)

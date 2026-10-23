@@ -59,7 +59,7 @@ write_web() {
  "DATABASE_URL":"\${{Postgres.DATABASE_URL}}","LOG_LEVEL":"info","NEXT_PUBLIC_SITE_URL":"https://shop.example",
  "RAILWAY_PUBLIC_DOMAIN":"web-production.up.railway.app","POSTMARK_SERVER_TOKEN":"$2",
  "AWS_REGION":"us-east-1","S3_BUCKET":"shop-uploads-prod","BETTER_AUTH_URL":"https://shop.example",
- "GITHUB_CLIENT_ID":"Iv1.0123456789abcdef","SLACK_WEBHOOK_URL":"https://hooks.slack.com/services/FIXTUREslackhook0001"}
+ "GITHUB_CLIENT_ID":"Iv1.0123456789abcdef","GITHUB_CLIENT_SECRET":"FIXTUREghoauth000000000001","SLACK_WEBHOOK_URL":"https://hooks.slack.com/services/FIXTUREslackhook0001"}
 EOF
 }
 write_web "sk-proj-FIXTUREopenai0000000000001" "FIXTUREpostmark00000000000001"
@@ -79,6 +79,7 @@ check "AI key is in group 1" 'awk "/^## 1\\./,/^## 2\\./" exposure.md | grep >/d
 check "database vars are in group 3" 'awk "/^## 3\\./,/^## 4\\./" exposure.md | grep >/dev/null "PGPASSWORD"'
 check "Stripe webhook secret groups with payments" 'awk "/^## 4\\./,/^## 5\\./" exposure.md | grep >/dev/null "STRIPE_WEBHOOK_SECRET"'
 check "GitHub token is a deploy token" 'awk "/^## 5\\./,/^## 6\\./" exposure.md | grep >/dev/null "GITHUB_TOKEN"'
+check "GitHub OAuth client secret is not a deploy token" '! awk "/^## 5\\./,/^## 6\\./" exposure.md | grep >/dev/null "GITHUB_CLIENT_SECRET" && grep >/dev/null "GITHUB_CLIENT_SECRET" exposure.md'
 check "auth secret is a session secret" 'awk "/^## 6\\./,/^## 8\\./" exposure.md | grep >/dev/null "BETTER_AUTH_SECRET"'
 check "reference var points at its source" 'awk "/^## 9\\./,/^## Not covered/" exposure.md | grep >/dev/null "DATABASE_URL\` (shop/production/web)"'
 check "short config value is left out" '! grep -q "LOG_LEVEL" exposure.md'
