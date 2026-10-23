@@ -35,7 +35,7 @@ python3 scripts/scan_codebase.py evals/payload-cms-vercel-railway/files/lumen --
 python3 scripts/estimate_cost.py --tier shared
 
 # Skill structure (from the skill-creator skill, if you have it)
-python3 -m scripts.quick_validate /path/to/railway-to-aws
+python3 -m scripts.quick_validate /path/to/derail
 ```
 
 ## Adding an eval case

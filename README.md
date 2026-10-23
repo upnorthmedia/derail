@@ -74,16 +74,19 @@ anyone can use it.
 ## Do this first: rotate everything
 
 Don't carry leaked credentials to a new home. You don't need AWS, or even a migration plan, for this
-part. With the Railway CLI logged in:
+part. With the Railway CLI logged in, from your app's repo:
 
 ```bash
+git clone https://github.com/upnorthmedia/derail ~/.claude/skills/derail   # same clone as Quick start
+DERAIL=~/.claude/skills/derail/scripts
+
 # 1. Before you rotate anything: list what's exposed and fingerprint the current values
-scripts/breach_check.sh --fingerprint migration/.secrets/railway.burned.sha256
+$DERAIL/breach_check.sh --fingerprint migration/.secrets/railway.burned.sha256
 
 # 2. Rotate, in the order railway-exposure.md gives you (AI provider keys first)
 
 # 3. Prove nothing exposed is still in use
-scripts/breach_check.sh --verify migration/.secrets/railway.burned.sha256
+$DERAIL/breach_check.sh --verify migration/.secrets/railway.burned.sha256
 ```
 
 `railway-exposure.md` lists every variable **by name** across every project you can see, grouped by
@@ -130,10 +133,10 @@ you don't need Railway to be up to plan your exit.
 **Claude Code**
 
 ```bash
-git clone https://github.com/upnorthmedia/railway-to-aws ~/.claude/skills/railway-to-aws
+git clone https://github.com/upnorthmedia/derail ~/.claude/skills/derail
 ```
 
-**Claude.ai / Cowork**: upload `railway-to-aws.skill` from the latest release (or build one with
+**Claude.ai / Cowork**: upload `derail.skill` from the latest release (or build one with
 `python -m scripts.package_skill .` from the skill-creator skill).
 
 Then ask, in your own words:

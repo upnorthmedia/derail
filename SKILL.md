@@ -1,5 +1,5 @@
 ---
-name: railway-to-aws
+name: derail
 description: Plan and generate a clean, secure, cost-aware migration of an application from Railway and/or Vercel to AWS (ECS Fargate, RDS PostgreSQL, S3/CloudFront, Secrets Manager) with Terraform, GitHub Actions OIDC, per-project billing and a step-by-step cutover runbook. Use this whenever someone wants to move, migrate, port, lift, or "get off" Railway or Vercel onto AWS, asks what it would cost or take to run their Railway/Vercel app on AWS, wants Terraform for an app that currently lives on a PaaS, needs to move a Railway Postgres or Vercel Blob store to RDS/S3, or asks for an AWS architecture or runbook for an existing Next.js/Node/Python app, or is leaving Railway after its October 2026 environment-variable breach and needs exposed secrets rotated first, even if they never say the word "migrate".
 ---
 
