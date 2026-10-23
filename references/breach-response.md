@@ -158,14 +158,34 @@ minute, and the plan says users will log in again. Two traps:
 - **Rotation helpers keep the old secret valid.** That is their point in a calm rotation, and exactly
   wrong after a leak.
 
-Per library (verified against their docs on 2026-10-22; re-check the installed version):
+Per library (verified against their docs on 2026-10-22, Payload also against its source on 2026-10-23;
+re-check the installed version):
 
-- **Payload** (`PAYLOAD_SECRET`): signs JWT sessions, encrypts API keys and any field encrypted with
-  `payload.encrypt`, and indexes API keys. Payload documents a `rotateSecret` utility plus a
-  `previousSecrets` config. While the old secret is in `previousSecrets`, **tokens signed with it still
-  verify**. So, inside the maintenance window with traffic stopped: set the new secret, add the old one to
-  `previousSecrets`, run `rotateSecret` so everything is re-keyed, remove `previousSecrets`, then open
-  traffic. Password logins are unaffected (hashes don't use the secret); sessions end.
+- **Payload** (`PAYLOAD_SECRET`): signs and verifies JWT sessions, encrypts API keys and anything
+  encrypted with `payload.encrypt`, and indexes API keys (an HMAC lookup). Password logins are
+  unaffected in both majors (salted PBKDF2 hashes don't use the secret); sessions end. Rotation tooling
+  depends on the installed major, so check `payload` in `package.json` first:
+  - **Payload 3** (stable; latest 3.92.0 on 2026-10-23) has no rotation helper: no `previousSecrets`, no
+    `rotateSecret`. JWTs and API-key lookups use only the current secret, so swapping it inside the
+    window ends every session (wanted here) and stops every existing API key from authenticating: plan
+    to regenerate API keys after the switch and say which users or integrations use them. Values the
+    code encrypted with `payload.encrypt` stay under the old secret, and Payload 3's AES-256-CTR decrypt
+    does not detect a wrong key (it returns garbage rather than failing). If the code or
+    `scan_codebase.py` shows such fields, plan a hand-written re-encryption step inside the window
+    (decrypt with the old key, encrypt with the new; Payload 3 derives the key as the first 32 hex
+    characters of SHA-256 of the secret, `packages/payload/src/index.ts`) and name the rows it touches.
+    These consequences are read from the v3.92.0 source, not tested.
+  - **Payload 4** (beta, 4.0.0-beta.4 on 2026-10-23) documents a `rotateSecret` utility plus a
+    `previousSecrets` config. While the old secret is in `previousSecrets`, **tokens signed with it still
+    verify** and API keys indexed under it still authenticate. So, inside the maintenance window with
+    traffic stopped: set the new secret with the old one in `previousSecrets`, run `rotateSecret` (dry
+    run first) for API keys and `payload.reencrypt` for the project's own encrypted fields, remove
+    `previousSecrets`, then open traffic. (Our judgment: don't move to a beta mid-incident just to get
+    this.)
+  - Sources: Payload 4 docs https://payloadcms.com/docs/beta/authentication/rotating-secret (no stable
+    page exists); `payloadcms/payload` at `v3.92.0`: `auth/strategies/jwt.ts`, `auth/strategies/apiKey.ts`,
+    `auth/baseFields/apiKey/{encryptAPIKey,setAPIKeyIndex}.ts`, `auth/crypto.ts`, `index.ts`,
+    `auth/strategies/local/generatePasswordSaltHash.ts`.
 - **Better Auth** (`BETTER_AUTH_SECRET` / `AUTH_SECRET`): used for encryption, signing and hashing.
   Versioned `secrets` (or `BETTER_AUTH_SECRETS`) put the new key first; older entries become
   decryption-only, and stored data re-encrypts lazily on write. Sessions live in the database: delete them

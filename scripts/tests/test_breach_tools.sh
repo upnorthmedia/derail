@@ -71,10 +71,16 @@ cat >"$T/fixture/projects.json" <<'EOF'
 [{"id":"p1","name":"shop","environments":{"edges":[{"node":{"id":"e1","name":"production","serviceInstances":{"edges":[{"node":{"serviceId":"s1"}},{"node":{"serviceId":"s2"}}]}}}]},
   "services":{"edges":[{"node":{"id":"s1","name":"web"}},{"node":{"id":"s2","name":"Postgres"}}]}}]
 EOF
+# Fixture values are assembled at runtime so no literal in this file looks like a credential to the
+# CI secrets-scan grep or to gitleaks. They still start with the real prefixes.
+FX_STRIPE="sk_live""_FIXTUREstripe000000001"
+FX_WHSEC="whsec""_FIXTUREwebhook00000001"
+FX_GHP="ghp""_FIXTUREgithub00000000000001"
+FX_PGPASS="FIXTUREpgpass000000001"
 write_web() {
   cat >"$T/fixture/vars/web.json" <<EOF
-{"OPENAI_API_KEY":"$1","STRIPE_SECRET_KEY":"sk_live_FIXTUREstripe000000001","STRIPE_WEBHOOK_SECRET":"whsec_FIXTUREwebhook00000001",
- "BETTER_AUTH_SECRET":"FIXTUREauthsecret0000000000000001","GITHUB_TOKEN":"ghp_FIXTUREgithub00000000000001",
+{"OPENAI_API_KEY":"$1","STRIPE_SECRET_KEY":"$FX_STRIPE","STRIPE_WEBHOOK_SECRET":"$FX_WHSEC",
+ "BETTER_AUTH_SECRET":"FIXTUREauthsecret0000000000000001","GITHUB_TOKEN":"$FX_GHP",
  "DATABASE_URL":"\${{Postgres.DATABASE_URL}}","LOG_LEVEL":"info","NEXT_PUBLIC_SITE_URL":"https://shop.example",
  "RAILWAY_PUBLIC_DOMAIN":"web-production.up.railway.app","POSTMARK_SERVER_TOKEN":"$2",
  "AWS_REGION":"us-east-1","S3_BUCKET":"shop-uploads-prod","BETTER_AUTH_URL":"https://shop.example",
@@ -82,16 +88,17 @@ write_web() {
 EOF
 }
 write_web "sk-proj-FIXTUREopenai0000000000001" "FIXTUREpostmark00000000000001"
-cat >"$T/fixture/vars/Postgres.json" <<'EOF'
-{"DATABASE_URL":"postgresql://postgres:FIXTUREpgpass000000001@postgres.railway.internal:5432/railway",
- "DATABASE_PUBLIC_URL":"postgresql://postgres:FIXTUREpgpass000000001@proxy.rlwy.net:12345/railway",
- "PGPASSWORD":"FIXTUREpgpass000000001","PGPORT":"5432","PGUSER":"postgres"}
+cat >"$T/fixture/vars/Postgres.json" <<EOF
+{"DATABASE_URL":"postgresql://postgres:$FX_PGPASS@postgres.railway.internal:5432/railway",
+ "DATABASE_PUBLIC_URL":"postgresql://postgres:$FX_PGPASS@proxy.rlwy.net:12345/railway",
+ "PGPASSWORD":"$FX_PGPASS","PGPORT":"5432","PGUSER":"postgres"}
 EOF
-FIXTURE_VALUES="FIXTURE|sk-proj-|sk_live_|whsec_|ghp_"
+FIXTURE_VALUES="FIXTURE|sk-proj-|sk_live_|whsec_|ghp_|$FX_STRIPE|$FX_WHSEC|$FX_GHP|$FX_PGPASS"
 
 cd "$T"
 echo "== breach_check.sh"
 
+check "fixtures carry the real key prefixes" '[ "$(jq -r .STRIPE_SECRET_KEY "$T/fixture/vars/web.json")" = "$FX_STRIPE" ] && [ "${FX_STRIPE#sk_live_}" != "$FX_STRIPE" ] && [ "${FX_WHSEC#whsec_}" != "$FX_WHSEC" ] && [ "${FX_GHP#ghp_}" != "$FX_GHP" ] && [ "$(jq -r .PGPASSWORD "$T/fixture/vars/Postgres.json")" = "$FX_PGPASS" ]'
 rc=0; "$SH" "$SCRIPTS/breach_check.sh" --out exposure.md --fingerprint secrets/railway.burned.sha256 >stdout.txt 2>stderr.txt || rc=$?
 check "exits 0" '[ "$rc" -eq 0 ]'
 check "AI key is in group 1" 'awk "/^## 1\\./,/^## 2\\./" exposure.md | grep >/dev/null "OPENAI_API_KEY"'

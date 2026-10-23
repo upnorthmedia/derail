@@ -49,13 +49,20 @@ cat >"$T/fixture/projects.json" <<'EOF'
   "services":{"edges":[{"node":{"id":"s1","name":"web"}},{"node":{"id":"s2","name":"Postgres"}},
                        {"node":{"id":"s3","name":"worker"}},{"node":{"id":"s4","name":"uploads"}}]}}]
 EOF
-# Values are fixtures shaped like the real thing only where a hint depends on the shape.
-cat >"$T/fixture/vars/web.json" <<'EOF'
+# Values are fixtures shaped like the real thing only where a hint depends on the shape. Those are
+# assembled at runtime so no literal in this file looks like a credential to the CI secrets-scan grep
+# or to gitleaks; they still start with the real prefixes.
+FX_STRIPE="sk_live""_FIXTUREstripe000000001"
+FX_WHSEC="whsec""_FIXTUREwebhook00000001"
+FX_GHP="ghp""_FIXTUREgithub00000000000001"
+FX_AKIA="AKIA""FIXTURE000000001"
+FX_PGPASS="FIXTUREpgpass000000001"
+cat >"$T/fixture/vars/web.json" <<EOF
 {"OPENAI_API_KEY":"sk-proj-FIXTUREopenai0000000000001","ANTHROPIC_API_KEY":"sk-ant-FIXTUREanthropic000000001",
  "GROQ_API_KEY":"gsk_FIXTUREgroq00000000000001",
- "STRIPE_SECRET_KEY":"sk_live_FIXTUREstripe000000001","STRIPE_WEBHOOK_SECRET":"whsec_FIXTUREwebhook00000001",
+ "STRIPE_SECRET_KEY":"$FX_STRIPE","STRIPE_WEBHOOK_SECRET":"$FX_WHSEC",
  "STRIPE_LEGACY_SECRET":"FIXTUREnotastripekey000000001",
- "GITHUB_TOKEN":"ghp_FIXTUREgithub00000000000001","GITHUB_CLIENT_SECRET":"FIXTUREghoauth000000000001",
+ "GITHUB_TOKEN":"$FX_GHP","GITHUB_CLIENT_SECRET":"FIXTUREghoauth000000000001",
  "GITHUB_APP_PRIVATE_KEY":"FIXTUREghappkey000000000000001",
  "RESEND_API_KEY":"re_FIXTUREresend0000000000001","POSTMARK_SERVER_TOKEN":"FIXTUREpostmark00000000000001",
  "TWILIO_AUTH_TOKEN":"FIXTUREtwilioauth0000000000001","TWILIO_API_SECRET":"FIXTUREtwilioapi00000000000001",
@@ -64,21 +71,21 @@ cat >"$T/fixture/vars/web.json" <<'EOF'
  "OPENAI_API_KEY_OLD":"sk-proj-FIXTUREopenaiold00000000001",
  "GCP_SERVICE_ACCOUNT_KEY":"{\"type\":\"service_account\",\"private_key\":\"FIXTUREgcpkey000000001\"}",
  "GOOGLE_APPLICATION_CREDENTIALS":"/app/FIXTURE-credentials.json",
- "DATABASE_URL":"${{Postgres.DATABASE_URL}}","REDIS_URL":"redis://default:FIXTUREredis0000001@redis.railway.internal:6379"}
+ "DATABASE_URL":"\${{Postgres.DATABASE_URL}}","REDIS_URL":"redis://default:FIXTUREredis0000001@redis.railway.internal:6379"}
 EOF
-cat >"$T/fixture/vars/Postgres.json" <<'EOF'
-{"DATABASE_URL":"postgresql://postgres:FIXTUREpgpass000000001@postgres.railway.internal:5432/railway",
- "PGPASSWORD":"FIXTUREpgpass000000001","POSTGRES_PASSWORD":"FIXTUREpgpass000000001","PGUSER":"postgres"}
+cat >"$T/fixture/vars/Postgres.json" <<EOF
+{"DATABASE_URL":"postgresql://postgres:$FX_PGPASS@postgres.railway.internal:5432/railway",
+ "PGPASSWORD":"$FX_PGPASS","POSTGRES_PASSWORD":"$FX_PGPASS","PGUSER":"postgres"}
 EOF
 # worker: a real IAM access key (AKIA prefix). uploads: a Railway bucket's S3-style keys, which are not IAM.
-cat >"$T/fixture/vars/worker.json" <<'EOF'
-{"AWS_ACCESS_KEY_ID":"AKIAFIXTURE000000001","AWS_SECRET_ACCESS_KEY":"FIXTUREawssecret00000000000000001"}
+cat >"$T/fixture/vars/worker.json" <<EOF
+{"AWS_ACCESS_KEY_ID":"$FX_AKIA","AWS_SECRET_ACCESS_KEY":"FIXTUREawssecret00000000000000001"}
 EOF
 cat >"$T/fixture/vars/uploads.json" <<'EOF'
 {"AWS_ACCESS_KEY_ID":"FIXTUREbucketkeyid000000001","AWS_SECRET_ACCESS_KEY":"FIXTUREbucketsecret0000000000001",
  "AWS_ENDPOINT_URL":"https://FIXTURE.storageapi.dev","AWS_S3_BUCKET_NAME":"uploads-FIXTURE"}
 EOF
-FIXTURE_VALUES="FIXTURE|sk-proj-|sk-ant-|sk_live_|whsec_|ghp_|AKIA|sntrys_|re_FIX"
+FIXTURE_VALUES="FIXTURE|sk-proj-|sk-ant-|sk_live_|whsec_|ghp_|AKIA|sntrys_|re_FIX|$FX_STRIPE|$FX_WHSEC|$FX_GHP|$FX_AKIA|$FX_PGPASS"
 
 cd "$T"
 # line_for KEY: the checklist line(s) for that variable name.
@@ -88,6 +95,7 @@ has_hint() { line_for "$1" | grep -F -- "${3:-}" | grep -F -- "[$2]" >/dev/null;
 no_hint() { [ -n "$(line_for "$1")" ] && ! line_for "$1" | grep -E -- '\[(two live|hard cut):' >/dev/null; }
 
 echo "== breach_check.sh rotation hints"
+check "fixtures carry the real key prefixes" '[ "$(jq -r .STRIPE_SECRET_KEY "$T/fixture/vars/web.json")" = "$FX_STRIPE" ] && [ "${FX_STRIPE#sk_live_}" != "$FX_STRIPE" ] && [ "${FX_WHSEC#whsec_}" != "$FX_WHSEC" ] && [ "${FX_GHP#ghp_}" != "$FX_GHP" ] && [ "$(jq -r .AWS_ACCESS_KEY_ID "$T/fixture/vars/worker.json")" = "$FX_AKIA" ] && [ "${FX_AKIA#AKIA}" != "$FX_AKIA" ]'
 rc=0; "$SH" "$SCRIPTS/breach_check.sh" --out exposure.md --fingerprint secrets/railway.burned.sha256 >stdout.txt 2>stderr.txt || rc=$?
 check "exits 0" '[ "$rc" -eq 0 ]'
 

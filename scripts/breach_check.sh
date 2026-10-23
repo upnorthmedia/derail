@@ -256,7 +256,7 @@ hint() {
     3) echo "Change the password (\`ALTER ROLE ... PASSWORD\`) and update every variable that references it. If the database had a public TCP proxy it was reachable from the internet: review roles, connections and recent schema changes." ;;
     4) echo "Roll the keys in the provider dashboard and review recent events, payouts and webhook endpoints for changes you did not make." ;;
     5) echo "Revoke and reissue, then read the account's security or audit log. Leaked registry credentials mean existing image tags can't be trusted: rebuild from source." ;;
-    6) echo "Anyone holding these can forge sessions or signatures. Rotating logs users out. If the library also encrypts stored data with it (Payload, Better Auth), re-encrypt with its rotation tooling, then remove the old value: keeping it as an accepted 'previous' secret keeps forged tokens valid." ;;
+    6) echo "Anyone holding these can forge sessions or signatures. Rotating logs users out. If the library also encrypts stored data with it (Payload, Better Auth), re-encrypt that data (with the library's rotation tooling where it has one; Payload 3 has none), then remove the old value: keeping it as an accepted 'previous' secret keeps forged tokens valid." ;;
     7) echo "Roll the signing secret at the sender. Until then, anyone can forge webhook events your app will accept." ;;
     8) echo "Rotate at each provider. Some of these may be plain config; skip the ones that are not secrets." ;;
     9) echo "These point at another variable (\`\${{Service.VAR}}\`). Rotate the source variable; these follow automatically." ;;
