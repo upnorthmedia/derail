@@ -1,23 +1,31 @@
-# railway-to-aws
+# Derail
 
-**A Claude skill that plans and generates a secure, cost-aware migration from Railway and Vercel to AWS, with Terraform.**
+**Railway got breached and can't stay up. Get off it. This Claude skill plans and generates the whole
+move to AWS, with Terraform.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Terraform 1.11+](https://img.shields.io/badge/Terraform-%E2%89%A5%201.11-7B42BC)
 ![OpenTofu 1.11+](https://img.shields.io/badge/OpenTofu-%E2%89%A5%201.11-FFDA18)
 ![AWS provider 6.x](https://img.shields.io/badge/AWS%20provider-6.x-FF9900)
 
-Give it an app that lives on Railway and/or Vercel and it produces a complete migration package:
-an inventory of everything the platforms know and the code assumes, a decided architecture with an
-honest monthly cost next to today's bill, validated Terraform, a Dockerfile, CI workflows, the
-application code changes, data-migration scripts, and a minute-by-minute cutover runbook with
-rollback. It generates and validates. Humans apply.
+On October 21, 2026, Railway told every customer to roll every environment variable they had ever
+stored there. An attacker got into the systems that hold them and, for some customers, walked away with
+the decrypted values. Deploys were frozen while they figured out what happened. That came after a
+year of the whole platform going dark for reasons customers couldn't control.
+
+If you're done waiting for the next status-page update, point this skill at your Railway app (and your
+Vercel frontend, if you have one). It produces a complete migration package: an inventory of everything
+the platform knows and your code assumes, a decided architecture with an honest monthly cost next to
+today's bill, validated Terraform, a Dockerfile, CI workflows, the application code changes,
+data-migration scripts, and a minute-by-minute cutover runbook with rollback. It generates and
+validates. Humans apply.
 
 ---
 
 ## Table of contents
 
-- [Why this exists](#why-this-exists)
+- [Why people are leaving](#why-people-are-leaving)
+- [Do this first: rotate everything](#do-this-first-rotate-everything)
 - [What you get](#what-you-get)
 - [Quick start](#quick-start)
 - [Target architecture](#target-architecture)
@@ -32,11 +40,28 @@ rollback. It generates and validates. Humans apply.
 
 ---
 
-## Why this exists
+## Why people are leaving
 
-Railway and Vercel hide a lot: TLS, port detection, private DNS, builds from source, secrets at
-build time, restart-on-crash, scale-to-zero billing, PR environments. A migration to AWS goes wrong
-when those implicit behaviours are rediscovered in production at 2 a.m. This skill makes Claude
+Railway is a great developer experience right up until it isn't. 2026 so far, from Railway's own
+incident reports and disclosures:
+
+| When | What happened |
+|---|---|
+| **Feb 11** | Railway's own anti-fraud system misfired and sent SIGTERM to about 3% of services on the platform, **including customer Postgres and MySQL databases**. Roughly four hours until automated recovery finished. ([incident report](https://blog.railway.com/p/incident-report-february-11-2026)) |
+| **May 19 to 20** | Google Cloud suspended Railway's production account. **Every workload in every region went unreachable** for about eight hours, including ones running on Railway Metal and AWS, because routing still depended on a control plane in GCP. ([incident report](https://blog.railway.com/p/incident-report-may-19-2026-gcp-account-outage)) |
+| **Oct 21 to 22** | An unauthorized party accessed the systems that store customer environment variables and, for some customers, obtained decrypted contents: API keys, database credentials, registry credentials. All deployments paused. Railway's advice to everyone: roll all of it. ([disclosure](https://blog.railway.com/p/security-disclosure-wednesday-october-21st), [TechCrunch](https://techcrunch.com/2026/10/22/developer-platform-railway-urges-all-users-to-revoke-secret-keys-after-cyberattack/)) |
+
+That's on top of the smaller stuff any status-page watcher has seen: stuck deploys, routing 404s,
+dashboard and login slowdowns. One platform-wide failure is bad luck. A pattern of them, ending in a
+secrets breach, is a reason to own your infrastructure.
+
+AWS isn't magic and it isn't cheaper (see [Cost](#cost-the-honest-version)). What you get is
+infrastructure you control, defined in code you can read, in an account with your own IAM, your own
+audit logs, and no shared control plane between you and a stranger's bad day.
+
+The hard part of leaving a PaaS is everything it hides: TLS, port detection, private DNS, builds from
+source, secrets at build time, restart-on-crash, scale-to-zero billing, PR environments. A migration goes
+wrong when those implicit behaviours are rediscovered in production at 2 a.m. This skill makes Claude
 surface every one of them *before* a single resource exists, and encodes the choices that keep small
 teams out of trouble: no secret values in Terraform state, same PostgreSQL major on both sides, nothing
 destructive on the source platform, per-project cost visibility inside a shared account.
@@ -44,6 +69,28 @@ destructive on the source platform, per-project cost visibility inside a shared 
 Built and maintained by [Up North Media](https://github.com/upnorthmedia), an Omaha web development and
 AI consulting agency, while moving its own client projects off Railway and Vercel. Published under MIT so
 anyone can use it.
+
+## Do this first: rotate everything
+
+Don't carry leaked credentials to a new home. Before (not during) the migration:
+
+1. **Assume every value you stored in Railway is burned.** API keys, database URLs, registry
+   credentials, OAuth client secrets, webhook signing secrets, session and auth secrets.
+2. **Revoke and reissue them at the source** (Stripe, OpenAI, Anthropic, Twilio, your registry, your
+   cloud provider), then update Railway so production keeps running while you migrate.
+3. **Check the providers' logs for use you didn't make.** Railway published follow-up guidance for
+   [GCP](https://blog.railway.com/p/security-disclosure-recommendation-check-for-anomalous-gcp-access)
+   and [AWS](https://blog.railway.com/p/security-disclosure-recommendation-check-for-anomalous-aws-access)
+   credentials specifically.
+4. **Rotate your database passwords too.** If a `DATABASE_URL` leaked, the database itself is exposed
+   until the password changes.
+
+Then run the migration. The skill already treats the move as a rotation event (see
+[Design principles](#design-principles)); its "keep identical through cutover" bucket for session secrets
+assumes those values were never exposed, so make sure they're the fresh ones from step 2.
+
+If Railway's dashboard, API or CLI is down when you start, the skill works from an exported inventory;
+you don't need Railway to be up to plan your exit.
 
 ## What you get
 
@@ -69,7 +116,8 @@ git clone https://github.com/upnorthmedia/railway-to-aws ~/.claude/skills/railwa
 
 Then ask, in your own words:
 
-> "Migrate my Railway app `api` and its Postgres to AWS with Terraform. Repo is in `./api`."
+> "Railway got breached and I'm done. Get my app `api` and its Postgres onto AWS with Terraform.
+> Repo is in `./api`. I've already rotated the keys."
 
 > "What would it cost to run our Vercel Next.js site (DB on Railway) on AWS? We have other client
 > projects in the same account and need per-project billing."
