@@ -1,7 +1,7 @@
 ---
 tags: [derail]
-max_turns: 60
-timeout_seconds: 1800
+max_turns: 150
+timeout_seconds: 3600
 allowed_tools: [Read, Glob, Grep, Skill, Write, Edit, Bash]
 ---
 
