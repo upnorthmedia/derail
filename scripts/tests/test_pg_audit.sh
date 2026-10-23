@@ -145,6 +145,34 @@ check "audit --dry-run exits 0" '[ "$rc" -eq 0 ]'
 check "audit --dry-run writes no report" '! ls out4/db-audit-*.md >/dev/null 2>&1'
 check "audit --dry-run masks the URL" '! grep -E "$SECRETS" g3.txt >/dev/null && grep >/dev/null "postgres:\*\*\*@" g3.txt'
 
+echo "== password in the URL query string"
+case "$DB_URL" in *\?*) qsep='&' ;; *) qsep='?' ;; esac
+QS_URL="$(printf '%s' "$DB_URL" | sed -E 's#://([^:/@]*):[^@]*@#://\1@#')${qsep}application_name=pg-audit-qs&password=$SUPER_PW"
+rc=0; SRC_URL="$QS_URL" env -u TGT_URL "$SH" "$SCRIPTS/pg_migrate.sh" audit --out out5 >q1.txt 2>&1 || rc=$?
+check "audit with ?password= exits 0" '[ "$rc" -eq 0 ]'
+check "query-string password is masked on stdout" '! grep "$SUPER_PW" q1.txt >/dev/null && grep >/dev/null "password=\*\*\*" q1.txt'
+check "query-string password is not in the report" '! cat out5/db-audit-*.md 2>/dev/null | grep "$SUPER_PW" >/dev/null'
+rc=0; SRC_URL="$QS_URL" env -u TGT_URL "$SH" "$SCRIPTS/pg_migrate.sh" audit --dry-run --out out6 >q2.txt 2>&1 || rc=$?
+check "query-string password is masked in --dry-run" '[ "$rc" -eq 0 ] && ! grep "$SUPER_PW" q2.txt >/dev/null'
+
+echo "== mask()"
+# the masking helpers are one-line functions; load them from the script and call them directly
+eval "$(grep -E '^mask(_stream)?\(\) ' "$SCRIPTS/pg_migrate.sh")"
+m_eq() { [ "$(mask "$1")" = "$2" ]; }
+check "URL user:password@ still masked" 'm_eq "postgresql://u:FIXTUREuserinfo0005@h/db" "postgresql://u:***@h/db"'
+check "URL ?password= masked, other params kept" \
+  'm_eq "postgresql://u@h:5432/db?sslmode=require&password=FIXTUREqs0004&application_name=x" "postgresql://u@h:5432/db?sslmode=require&password=***&application_name=x"'
+check "URL ?password= as the first parameter" 'm_eq "postgresql://u@h/db?password=FIXTUREqs0006" "postgresql://u@h/db?password=***"'
+check "conninfo password= masked" \
+  'm_eq "host=db user=u password=FIXTUREconninfo0001 dbname=app" "host=db user=u password=*** dbname=app"'
+check "conninfo password at the start" 'm_eq "password=FIXTUREconninfo0007 host=db" "password=*** host=db"'
+check "conninfo quoted password with spaces and an escaped quote" \
+  "m_eq \"password='FIXTURE quoted\\\\' 0002' host=db\" \"password=*** host=db\""
+check "conninfo spaces around =" 'm_eq "host=db password = FIXTUREspaced0003 dbname=app" "host=db password=*** dbname=app"'
+check "conninfo unquoted password containing & is masked whole" 'm_eq "password=FIXTUREamp&rest0009 host=db" "password=*** host=db"'
+check "conninfo sslpassword= masked" 'm_eq "sslcert=c.crt sslpassword=FIXTUREsslkey0008 host=db" "sslcert=c.crt sslpassword=*** host=db"'
+check "names that only contain 'password' are left alone" 'm_eq "host=db application_name=passwordless" "host=db application_name=passwordless"'
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
