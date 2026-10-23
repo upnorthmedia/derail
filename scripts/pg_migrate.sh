@@ -128,8 +128,11 @@ export PGSSLMODE="${PGSSLMODE:-require}"
 export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-15}"
 export PGOPTIONS="${PGOPTIONS:-} -c statement_timeout=0"
 
-# mask user:password@ in any URL-looking string
-mask() { printf '%s' "$1" | sed -E 's#(://[^:/@]*):[^@]*@#\1:***@#g'; }
+# mask secrets in connection strings: user:password@ in URLs; password= / sslpassword= as a URL query
+# parameter (value ends at & or whitespace); and in key=value conninfo (value ends at whitespace, or is
+# single-quoted with \' escapes; spaces around = allowed)
+mask_stream() { sed -E -e 's#(://[^:/@]*):[^@]*@#\1:***@#g' -e 's#([?&])(ssl)?password=[^&[:space:]]*#\1\2password=***#g' -e 's#(^|[[:space:]])(ssl)?password[[:space:]]*=[[:space:]]*('"'"'([^'"'"'\\]|\\.)*'"'"'|[^[:space:]]*)#\1\2password=***#g'; }
+mask() { printf '%s' "$1" | mask_stream; }
 # db name from a URL path (postgresql://.../NAME?x=y)
 url_db() { printf '%s' "$1" | sed -nE 's#^[a-z]+://[^/]*/([^?]*).*$#\1#p'; }
 # replace the db name in a URL (keeps query string)
@@ -212,7 +215,7 @@ do_preflight() {
     pq_at "$SRC_URL" -c "SELECT DISTINCT pg_get_userbyid(relowner) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')"
     echo "## tables without primary key (checksums fall back to full-row ordering; logical replication would need REPLICA IDENTITY FULL)"
     pq_at "$SRC_URL" -c "SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast','pgbouncer') AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisprimary) ORDER BY 1"
-    echo "## publications / subscriptions / event triggers on source (skipped by dump flags)"
+    echo "## publications / subscriptions (skipped by dump flags) / event triggers (carried by the dump) on source"
     pq_at "$SRC_URL" -c "SELECT 'publication: '||pubname FROM pg_publication UNION ALL SELECT 'subscription: '||subname FROM pg_subscription UNION ALL SELECT 'event trigger: '||evtname FROM pg_event_trigger"
     echo "## target"
     tgt_ver="$(pq_at "$TGT_URL" -c 'SELECT version()')"; echo "$tgt_ver"
@@ -364,9 +367,9 @@ do_restore() {
     printf '  $ %s\n' "${shown[*]}"
     if ! pg_restore "${args[@]}" "$DUMP_DIR/data" >"$logf" 2>&1; then
       log "pg_restore FAILED; error lines from $logf (first 10):"
-      grep -nE 'pg_restore: (error|warning)|^ERROR:|^DETAIL:' "$logf" | head -n 10 | sed -E 's#(://[^:/@]*):[^@]*@#\1:***@#g'
+      grep -nE 'pg_restore: (error|warning)|^ERROR:|^DETAIL:' "$logf" | head -n 10 | mask_stream
       log "last lines:"
-      tail -n 5 "$logf" | sed -E 's#(://[^:/@]*):[^@]*@#\1:***@#g'
+      tail -n 5 "$logf" | mask_stream
       if grep -q 'duplicate key value violates unique constraint "spatial_ref_sys_pkey"' "$logf"; then
         log "HINT: PostGIS spatial_ref_sys rows conflict with the ones CREATE EXTENSION inserted: re-run dump with --exclude-table-data='spatial_ref_sys'"
       fi
