@@ -26,6 +26,9 @@ scripts do the discovery and data movement around it.
   (or your SSH key) and the AWS credential chain, and prints only paths, counts and sizes.
 - `scan_codebase.py` classifies env var **names** (secret / public build-time / config / platform) and
   reports them in a table; `.env*` files contribute names only.
+- `breach_check.sh` reads variable values into a `umask 077` temp dir only long enough to classify and
+  fingerprint them. Fingerprints (`lib/fingerprint.sh`: sha256 over the value's base64, values under 8
+  characters skipped) are the only value-derived thing it writes, to a mode-600 file you choose.
 
 Claude (or a human) reading the inventories therefore never sees a credential. When a value is needed
 (for example to seed Secrets Manager), it flows file -> tool, not through the conversation.
@@ -64,13 +67,16 @@ migration/
 | `blob_to_s3.ts` | Vercel Blob -> S3: cursor-paginated `list()`, `head()` for content type / cache headers, `HeadObject` size check (re-runnable), `p-limit` parallel copy, ndjson manifest, private stores via `BLOB_ACCESS=private`, `S3_PREFIX` | `BLOB_READ_WRITE_TOKEN`, `S3_BUCKET`, `S3_PREFIX`, `BLOB_ACCESS`, AWS credential chain; `--dry-run` (count only), `--prefix`, `--concurrency`, `--limit` | Objects in S3 with correct `Content-Type`; `migration/blob-manifest.ndjson` for the DB URL rewrite |
 | `railway_bucket_to_s3.sh` | Railway Bucket (Tigris, S3-compatible) -> local staging -> S3, both legs `aws s3 sync` (incremental). Notes rclone for buckets larger than local disk | `--bucket <name> --target s3://bucket/prefix [--staging dir] [--delete] [--dry-run]` | Synced objects; counts |
 | `railway_volume_to_s3.sh` | Railway **volume** (block storage mounted in a service, e.g. `/data`) -> local staging -> S3. `--method files` uses `railway volume files download <mount-path> <staging>` (newer CLI); `--method scp` uses `scp -r <service>@ssh.railway.com:<mount-path>/. <staging>` (needs working `railway ssh` for the service). Then `aws s3 sync` (Content-Type guessed from the extension; extensionless files are reported with a `--content-type` / `--metadata-directive REPLACE` note). Idempotent; writes a `path/bytes/sha256/content_type` manifest for rewriting DB paths | `--service <svc> [--mount-path /data] --target s3://bucket/prefix [--staging dir] [--method files\|scp] [--environment e] [--delete] [--dry-run] [-- extra sync args]` | Staged files, `<staging>.manifest.tsv`, count/size summary |
-| `put_secrets.sh` | KEY=VALUE `.env` -> one JSON secret in Secrets Manager. The secret name is the one the Terraform secrets module creates: **`<project>-<env>/app`** (e.g. `lumen-prod/app`, output `app_secret_name`), not `<project>/<env>/app`. Writes via `put-secret-value --secret-string file://`; refuses `RAILWAY_*`/`VERCEL_*` and (by default) `NEXT_PUBLIC_*` keys; `--diff` compares names with the live secret. Reads the file only, never prompts | `--secret-name <project>-<env>/app --env-file [--region] [--dry-run] [--diff] [--create]` | Key names, counts, new `VersionId` |
+| `put_secrets.sh` | KEY=VALUE `.env` -> one JSON secret in Secrets Manager. The secret name is the one the Terraform secrets module creates: **`<project>-<env>/app`** (e.g. `lumen-prod/app`, output `app_secret_name`), not `<project>/<env>/app`. Writes via `put-secret-value --secret-string file://`; refuses `RAILWAY_*`/`VERCEL_*` and (by default) `NEXT_PUBLIC_*` keys; `--diff` compares names with the live secret. Reads the file only, never prompts. When `railway.burned.sha256` sits next to the env file (or `--burned-hashes FILE` is given), refuses any value whose fingerprint is in it, naming the key, never the value; `--allow-carryover KEY` for a non-secret false positive. No fingerprint file, no check | `--secret-name <project>-<env>/app --env-file [--region] [--dry-run] [--diff] [--create] [--burned-hashes FILE] [--allow-carryover KEY] [--no-burned-check]` | Key names, counts, new `VersionId` |
+| `breach_check.sh` | "Am I exposed?" after Railway's 2026-10-21 breach. Walks every project / environment / service the CLI can see and writes a rotation checklist of variable **names**, grouped by priority (AI provider keys, cloud credentials, databases, payments, deploy tokens, session secrets, webhooks, other, references). Needs only the Railway CLI: no AWS, no migration. `--fingerprint FILE` records fingerprints of the current (exposed) values: run it **before** rotating. `--verify FILE` re-reads Railway and lists every variable still holding an exposed value (exit 1 if any) | `[--project ...] [--environment ...] [--out railway-exposure.md] [--fingerprint migration/.secrets/railway.burned.sha256] [--verify FILE]` | Markdown checklist (names only); fingerprint file (mode 600); CLI failures in `<out>.errors.log` |
 | `estimate_cost.py` | Itemized monthly AWS estimate for budget / standard / production tiers with overrides (tasks, cpu/memory, RDS class, Multi-AZ, NAT, CloudFront plan, WAF, cache, ALB dedicated/shared, secrets, logs, Container Insights, worker tasks). Workers are priced on-demand unless `--worker-spot` (~70% off, unverified); a KMS CMK is added only with `--kms` (never implied by a tier); `--s3-gb` (S3 Standard $0.023/GB-mo + request/egress note), `--efs-gb` ($0.30/GB-mo), `--migration-host` (t4g.nano ~$3.07 + IPv4 $3.65 while it exists); `--region` other than us-east-1 prints a 5-20% note; `--railway-monthly` prints the delta; `--json` | flags | Table or JSON. Header states prices verified 2026-10-22 us-east-1 list prices and that data transfer is excluded |
 
 ## Typical order
 
 ```bash
 scripts/check_prereqs.sh --pg-major 18          # add --offline when planning on a machine without AWS/Railway/Vercel access
+# breach response only (values were on Railway on/after 2026-10-21): fingerprint BEFORE rotating anything
+scripts/breach_check.sh --project my-app --fingerprint migration/.secrets/railway.burned.sha256 --out migration/BREACH-CHECK.md
 scripts/railway_inventory.sh --project my-app --environment production
 scripts/vercel_inventory.sh --project my-site --team my-team --repo .
 python3 scripts/scan_codebase.py . --out migration/inventory/codebase.json --md migration/inventory/CODEBASE.md \
@@ -97,7 +103,21 @@ scripts/railway_volume_to_s3.sh --service api --mount-path /data --target s3://m
 # The secret name is <project>-<env>/app, as created by the Terraform secrets module (output app_secret_name).
 scripts/put_secrets.sh --secret-name my-app-prod/app --env-file migration/.secrets/aws.prod.env --diff
 scripts/put_secrets.sh --secret-name my-app-prod/app --env-file migration/.secrets/aws.prod.env
+# breach response: refuses exposed values automatically (railway.burned.sha256 sits next to the env file);
+# prove Railway itself no longer holds any exposed value
+scripts/breach_check.sh --project my-app --verify migration/.secrets/railway.burned.sha256
 ```
+
+## Tests
+
+```bash
+bash scripts/tests/test_breach_tools.sh                          # bash from PATH
+BASH_UNDER_TEST=/bin/bash /bin/bash scripts/tests/test_breach_tools.sh   # macOS bash 3.2
+```
+
+Runs `breach_check.sh`, `railway_inventory.sh` and `put_secrets.sh --dry-run` against a stand-in
+`railway` CLI and asserts that grouping, fingerprints, verification and the exposed-value guard work and
+that no fixture value appears in any output. Needs jq; no Railway or AWS access.
 
 ## Migrations: the tools image and the deploy workflow
 
@@ -124,5 +144,8 @@ All three Dockerfile templates bake the RDS CA bundle at `/app/global-bundle.pem
 - `railway_volume_to_s3.sh --method files` depends on `railway volume files download`, which exists only
   in newer Railway CLI releases; older CLIs must use `--method scp` (requires `railway ssh` to work for the
   service, i.e. a running deployment and an SSH key linked to the account).
+- `breach_check.sh` cannot see sealed variables (the CLI cannot read them) or copies of a key outside
+  Railway; the checklist says so. Its fingerprints only help if taken before rotation: a fingerprint of an
+  already-rotated value protects nothing.
 - `scan_codebase.py` pattern detections (TLS off, Twilio URL, filesystem writes) are regex-based and
   reviewed by hand: they point at files, they do not prove a problem.
