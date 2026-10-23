@@ -96,11 +96,15 @@ CMD ["npm", "run", "db:migrate"]
 # ---------- prod-deps: prune dev dependencies for the runtime image ----------
 FROM builder AS prod-deps
 # (2) Prune dev dependencies so the runtime image stays small. Yarn 2+ (its yarn.lock has `__metadata:`) prunes with
-#     its own command: `npm prune` rejects Yarn-only specifiers such as `patch:`. That re-fetches packages, hence
-#     the NPM_TOKEN secret again.
+#     `yarn workspaces focus --all --production`, since `npm prune` rejects Yarn-only specifiers such as `patch:`.
+#     That re-fetches packages, hence the NPM_TOKEN secret again. `workspaces focus` comes from the workspace-tools
+#     plugin, built into Yarn 4 but not Yarn 2/3: without it this falls back to `npm prune`. If that fails too (e.g. a
+#     `patch:` dependency), run `yarn plugin import workspace-tools` and commit .yarn/plugins and .yarnrc.yml.
 RUN --mount=type=secret,id=NPM_TOKEN,env=NPM_TOKEN \
     sh -c 'if [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm prune --prod; \
-    elif grep "^__metadata:" yarn.lock >/dev/null 2>&1; then corepack enable yarn && yarn workspaces focus --all --production; \
+    elif grep "^__metadata:" yarn.lock >/dev/null 2>&1; then corepack enable yarn \
+      && if yarn workspaces focus --help >/dev/null 2>&1; then yarn workspaces focus --all --production; \
+      else npm prune --omit=dev || { echo "npm prune failed and this Yarn has no workspaces focus command. Run: yarn plugin import workspace-tools, then commit .yarn/plugins and .yarnrc.yml" >&2; exit 1; }; fi; \
     else npm prune --omit=dev; fi'
 
 # ---------- runner: final/default stage ----------

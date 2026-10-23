@@ -13,7 +13,8 @@ First tagged release. Everything since the initial public commit.
     writes a names-only rotation checklist (AI provider keys first). Each variable whose provider is
     known notes whether old and new keys can be live together. `--fingerprint` records sha256
     fingerprints of current values before rotation; `--verify` lists any readable Railway variable that
-    still holds an exposed value.
+    still holds an exposed value (exit 1), or exits 3 when some service could not be read. An existing
+    fingerprint file is never overwritten.
   - `put_secrets.sh` refuses any value whose fingerprint is in `railway.burned.sha256` next to the env
     file (or `--burned-hashes`), with `--allow-carryover` for false positives.
   - `migration/BREACH.md`, a per-provider rotation table (dual-key vs hard-cut), and session/auth
