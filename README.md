@@ -28,6 +28,7 @@ validates. Humans apply.
 - [Do this first: rotate everything](#do-this-first-rotate-everything)
 - [What you get](#what-you-get)
 - [Quick start](#quick-start)
+- [Fewer keys to leak](#fewer-keys-to-leak)
 - [Target architecture](#target-architecture)
 - [Cost: the honest version](#cost-the-honest-version)
 - [Design principles](#design-principles)
@@ -72,22 +73,42 @@ anyone can use it.
 
 ## Do this first: rotate everything
 
-Don't carry leaked credentials to a new home. Before (not during) the migration:
+Don't carry leaked credentials to a new home. You don't need AWS, or even a migration plan, for this
+part. With the Railway CLI logged in:
+
+```bash
+# 1. Before you rotate anything: list what's exposed and fingerprint the current values
+scripts/breach_check.sh --fingerprint migration/.secrets/railway.burned.sha256
+
+# 2. Rotate, in the order railway-exposure.md gives you (AI provider keys first)
+
+# 3. Prove nothing exposed is still in use
+scripts/breach_check.sh --verify migration/.secrets/railway.burned.sha256
+```
+
+`railway-exposure.md` lists every variable **by name** across every project you can see, grouped by
+what an attacker could do with it, with what to rotate and where to look for misuse. No value is
+ever printed. The fingerprints are sha256 hashes in a mode-600 file, and they matter later:
+`put_secrets.sh` refuses to load any value into AWS that matches one, so a leaked key can't quietly move
+house with you.
 
 1. **Assume every value you stored in Railway is burned.** API keys, database URLs, registry
    credentials, OAuth client secrets, webhook signing secrets, session and auth secrets.
 2. **Revoke and reissue them at the source** (Stripe, OpenAI, Anthropic, Twilio, your registry, your
-   cloud provider), then update Railway so production keeps running while you migrate.
+   cloud provider), then update Railway so production keeps running while you migrate. Where a provider
+   allows two live keys, deploy the new one before revoking the old.
 3. **Check the providers' logs for use you didn't make.** Railway published follow-up guidance for
    [GCP](https://blog.railway.com/p/security-disclosure-recommendation-check-for-anomalous-gcp-access)
    and [AWS](https://blog.railway.com/p/security-disclosure-recommendation-check-for-anomalous-aws-access)
    credentials specifically.
 4. **Rotate your database passwords too.** If a `DATABASE_URL` leaked, the database itself is exposed
    until the password changes.
+5. **Sealed variables** don't show up in any CLI output. Check each service in the dashboard.
 
-Then run the migration. The skill already treats the move as a rotation event (see
-[Design principles](#design-principles)); its "keep identical through cutover" bucket for session secrets
-assumes those values were never exposed, so make sure they're the fresh ones from step 2.
+Then run the migration and tell Claude your values were on Railway during the breach. The skill switches
+to **breach mode**: it writes `migration/BREACH.md`, drops the usual "keep session secrets identical
+through cutover" shortcut, and rotates session and auth secrets at the cutover minute instead, without
+leaving the leaked one valid. Ordinary migrations skip all of this.
 
 If Railway's dashboard, API or CLI is down when you start, the skill works from an exported inventory;
 you don't need Railway to be up to plan your exit.
@@ -101,6 +122,7 @@ you don't need Railway to be up to plan your exit.
 | `infra/` | Terraform: `bootstrap` (state bucket, GitHub OIDC, cost-allocation tags, account budget), shared `network`, optional shared `platform`, eleven plain-resource modules, one root per project per environment. Passes `terraform validate` and `tflint` |
 | `Dockerfile`, workflows, code changes | Next.js standalone / Node / Python Dockerfiles with a separate `tools` image for migrations; GitHub Actions for plan-on-PR, apply-on-main and build → migrate → deploy; snippets for health routes, `next.config`, Payload CMS, Better Auth, webhooks, pg pools |
 | `migration/DATA.md` | `pg_dump`/`pg_restore` (or logical replication) with verification, Vercel Blob / Railway bucket / volume copy, stored-URL rewrites |
+| `migration/BREACH.md` | Breach mode only: every exposed variable by name, in rotation order, with what an attacker could do, where to rotate, and where to check for misuse |
 | `migration/RUNBOOK.md` | T-7 to T+14: rehearsal, DNS strategy, cutover minute by minute, rollback triggers and exposure, rotation and decommissioning |
 
 ## Quick start
@@ -127,6 +149,21 @@ Then ask, in your own words:
 Tools the skill uses when present: `railway`, `vercel`, `aws`, `terraform` or `tofu`, `tflint`,
 `docker`, `pg_dump` (matching the source major), `jq`, `node`, and the Railway / Vercel / AWS MCP
 servers. It works from an exported inventory when none of them are available.
+
+## Fewer keys to leak
+
+Every plan opens with a keyless scorecard: how many long-lived secrets your app holds on Railway today,
+and how many it holds on AWS, counted from your own inventory. The difference is structural:
+
+| On Railway | On AWS |
+|---|---|
+| Bucket access keys in env vars | Task IAM role, no keys |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Task IAM role, no keys |
+| Database superuser password, public `DATABASE_PUBLIC_URL` | RDS-managed master secret; private-subnet database |
+| `RAILWAY_TOKEN` / `VERCEL_TOKEN` in CI | GitHub OIDC, short-lived credentials |
+
+Your third-party API keys still exist on AWS, in one Secrets Manager secret per app that only that app's
+execution role can read. But the credentials that hand over your infrastructure are gone.
 
 ## Target architecture
 
@@ -207,16 +244,16 @@ serverless sleeping are all mapped in `references/railway-inventory.md`.
 SKILL.md                     the workflow Claude follows (discover → decide → generate → data → runbook)
 references/                  railway-inventory · vercel-inventory · aws-target-architecture
                              terraform-conventions · app-changes · data-migration
-                             security-and-billing · cutover-runbook-template
+                             security-and-billing · cutover-runbook-template · breach-response
 assets/terraform/            bootstrap/ network/ platform/ modules/ live/example-app/prod/
                              Makefile · .tflint.hcl · .pre-commit-config.yaml · .gitignore
 assets/docker/               Dockerfile.nextjs · Dockerfile.node · Dockerfile.python · dockerignore
 assets/app-snippets/         nextjs/ react-router/ payload/ better-auth/ webhooks/ db/
 assets/github-workflows/     terraform.yml (plan/apply) · deploy.yml (build → migrate → apply)
-scripts/                     check_prereqs · railway_inventory · vercel_inventory · scan_codebase
+scripts/                     breach_check · check_prereqs · railway_inventory · vercel_inventory · scan_codebase
                              pg_migrate (+ sql/) · blob_to_s3 · railway_bucket_to_s3 · railway_volume_to_s3
-                             put_secrets · estimate_cost
-evals/                       four test cases with fixture repos and inventories (fictional projects)
+                             put_secrets · estimate_cost · lib/ · tests/
+evals/                       five test cases with fixture repos and inventories (fictional projects)
 ```
 
 Terraform modules: `alb_https`, `ecs_service`, `rds_postgres`, `valkey`, `secrets`, `scheduled_task`,

@@ -64,9 +64,13 @@ tagging in every root.
    `AUTH_SECRET`/`BETTER_AUTH_SECRET` identical through cutover (sessions/encrypted fields) and rotate
    them with a planned re-login a week later; dual-register webhooks so each platform has its own
    signing secret; rotate the RDS app-user password and delete Railway's TCP proxy after cutover.
+   **Breach mode** (values exposed, e.g. Railway 2026-10-21): there is no "keep identical" bucket.
+   Exposed values rotate before migration work starts and session secrets rotate at the cutover minute
+   without leaving the leaked one in any "previous secrets" list; see `references/breach-response.md`.
 3. `scripts/put_secrets.sh` writes the JSON secret from the `.env` file via a temp file, prints key
    names and the new version id only, and refuses `RAILWAY_*`/`VERCEL_*` keys and `NEXT_PUBLIC_*`
-   (build-time, not secret) unless overridden.
+   (build-time, not secret) unless overridden. When `railway.burned.sha256` (from
+   `breach_check.sh --fingerprint`) sits next to the env file, it also refuses any exposed value.
 4. ECS reads secrets at task start only; after rotation run a forced new deployment.
 5. Terraform: `manage_master_user_password`, secret containers without versions, write-only arguments
    if values must be managed; `sensitive = true` on anything that could leak into output; never
