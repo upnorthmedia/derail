@@ -29,6 +29,25 @@ cat >"$T/bin/railway" <<'EOF'
 #!/usr/bin/env bash
 set -eu
 D="$FAKE_RAILWAY_DIR"
+# 5.x-like `--help`: railway_inventory.sh reads the Commands: block to decide which subcommands exist.
+if [ "${!#}" = "--help" ]; then
+  words="$*"; words="${words%--help}"; words="${words% }"
+  case "$words" in
+    "") cmds="bucket config cron domain environment functions link list postgres service status usage variable volume whoami help" ;;
+    service) cmds="list link status help" ;;
+    environment) cmds="config list new help" ;;
+    domain|volume|bucket|cron|functions) cmds="list help" ;;
+    config) cmds="pull help" ;;
+    postgres) cmds="ha pgbouncer pitr help" ;;
+    "postgres ha"|"postgres pgbouncer"|"postgres pitr") cmds="status help" ;;
+    usage) cmds="projects help" ;;
+    *) echo "error: unrecognized subcommand '${words%% *}'" >&2; exit 2 ;;
+  esac
+  printf 'Usage: railway %s [COMMAND]\n\nCommands:\n' "$words"
+  for c in $cmds; do printf '  %-12s %s\n' "$c" "$c"; done
+  printf '\nOptions:\n  -h, --help  Print help\n'
+  exit 0
+fi
 svc=""
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do [ "${args[$i]}" = "-s" ] && svc="${args[$((i + 1))]}"; done
@@ -122,6 +141,7 @@ mkdir -p inv && (cd inv && "$SH" "$SCRIPTS/railway_inventory.sh" --project p1 >i
 check "classifies with the shared classifier" '[ "$(jq -r ".variables[] | select(.name==\"OPENAI_API_KEY\") | .class" inv/migration/inventory/railway/variables/web.json)" = "app_secret" ]'
 check "references stay references" '[ "$(jq -r ".variables[] | select(.name==\"DATABASE_URL\") | .class" inv/migration/inventory/railway/variables/web.json)" = "reference" ]'
 check "values land only in .secrets" '[ -s inv/migration/.secrets/railway.web.env ] && ! grep -Eqr "$FIXTURE_VALUES" inv/migration/inventory inv/inv.out'
+check "runs with its subcommand guard active" '[ -f inv/migration/inventory/railway/errors.log ] && ! grep "subcommand checks\] disabled" inv/migration/inventory/railway/errors.log >/dev/null'
 
 echo "== put_secrets.sh exposed-value guard (dry-run)"
 mkdir -p mig
