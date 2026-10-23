@@ -97,7 +97,10 @@ for misuse" columns from the provider table in section 4. For a provider that is
 Copy the "Two live at once?" answer into BREACH.md's "Dual-key?" column as `yes`, `grace <window>` or
 `no`. Every cell comes from the provider's own documentation, checked on 2026-10-22 (sources below the
 table); providers change these rules, so re-check the linked page when a row matters. A provider that
-is not listed gets "check the provider's docs", never a guess.
+is not listed gets "check the provider's docs", never a guess. `breach_check.sh` prints the same answer
+in brackets after each variable name it recognises (`[two live: yes]`, `[two live: grace, up to 7 days]`,
+`[hard cut: one password per role]`); a name with no note is not in this table. When a row here changes,
+update `rotation_hint` in `scripts/breach_check.sh` to match.
 
 | Provider / credential | Two live at once? | Safe order | Check for misuse |
 |---|---|---|---|

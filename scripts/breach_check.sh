@@ -91,7 +91,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 ERRLOG="${OUT%.md}.errors.log"
 : >"$ERRLOG"
-ROWS="$TMP/rows.tsv"            # order<TAB>group<TAB>KEY<TAB>location
+ROWS="$TMP/rows.tsv"            # order<TAB>group<TAB>KEY<TAB>location<TAB>rotation hint (may be empty)
 : >"$ROWS"
 FP_NEW="$TMP/fingerprints.tsv"  # fingerprint<TAB>location/KEY
 : >"$FP_NEW"
@@ -104,8 +104,34 @@ classify_jq="$(cat "$SCRIPT_DIR/lib/classify_vars.jq")"
 # Names-only priority groups. First match wins, so provider prefixes come before generic suffixes.
 # Rows use: order, group label, key. Classes that are not secrets are dropped; short values with
 # config-looking names are counted as config instead of cluttering the checklist.
+#
+# Rotation hints: whether the provider lets the old and new credential work at the same time. Taken
+# only from the provider table in references/breach-response.md section 4; keep the two in step.
+# Exact names (plus a value-shape check where a name alone is ambiguous). Anything else gets no hint.
 group_jq="$classify_jq"'
-  | map(. as $e | classify($e.key; $e.value) as $c | ($e.value | tostring) as $v | $e.key as $k
+  | def rotation_hint($k; $v; $iam):
+      if $k == "OPENAI_API_KEY" then "two live: yes"
+      elif $k == "ANTHROPIC_API_KEY" then "two live: yes; Anthropic advises revoking at once"
+      elif ($k | IN("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")) and $iam then "two live: yes, 2 keys per IAM user"
+      elif ((try ($v | fromjson | .type) catch null) == "service_account") then "two live: yes, up to 10 keys per service account"
+      elif ($k | startswith("STRIPE_")) and ($v | test("^(sk|rk)_(live|test)_")) then "two live: grace, up to 7 days"
+      elif ($k | startswith("STRIPE_")) and ($v | startswith("whsec_")) then "two live: grace, up to 24 hours"
+      elif ($k | IN("GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT", "GH_PAT", "GITHUB_PERSONAL_ACCESS_TOKEN")) then "two live: yes, if a personal access token"
+      elif ($k | IN("GITHUB_CLIENT_SECRET", "GITHUB_OAUTH_CLIENT_SECRET", "AUTH_GITHUB_SECRET")) then "two live: yes, if an OAuth app"
+      elif $k == "GITHUB_APP_PRIVATE_KEY" then "two live: yes, up to 25 keys"
+      elif ($k | IN("PGPASSWORD", "POSTGRES_PASSWORD")) or ($v | test("^postgres(ql)?://[^/@:]*:[^/@]+@")) then "hard cut: one password per role"
+      elif $k == "RESEND_API_KEY" then "two live: yes"
+      elif ($k | IN("POSTMARK_SERVER_TOKEN", "POSTMARK_SERVER_API_TOKEN", "POSTMARK_API_TOKEN", "POSTMARK_API_KEY", "POSTMARK_ACCOUNT_TOKEN", "POSTMARK_ACCOUNT_API_TOKEN")) then "two live: yes"
+      elif $k == "TWILIO_AUTH_TOKEN" then "two live: yes, via a secondary Auth Token"
+      elif ($k | IN("TWILIO_API_KEY", "TWILIO_API_SECRET", "TWILIO_API_KEY_SECRET")) then "two live: yes"
+      elif $k == "SENTRY_AUTH_TOKEN" then "two live: yes"
+      elif $k == "SENTRY_DSN" then "two live: yes; Sentry says DSNs are safe to keep public"
+      else "" end;
+    # AKIA marks a long-term IAM access key (IAM identifiers reference); Railway bucket keys use the
+    # same AWS_* names but are not IAM users.
+    (any(.[]; .key == "AWS_ACCESS_KEY_ID" and ((.value | tostring) | startswith("AKIA")))) as $iam
+  | map(. as $e | ($e.value | tostring) as $v
+      | (classify($e.key; $e.value) as $c | $e.key as $k
       | if ($c == "railway_injected") and (($k | test("^RAILWAY_(API_)?TOKEN$")) | not) then empty
         elif ($c | IN("build_tuning", "public_buildtime", "empty")) then empty
         elif $c == "reference" then [9, "References (rotate the source variable, not these)", $k]
@@ -120,7 +146,8 @@ group_jq="$classify_jq"'
         elif ($k | test("^(GITHUB|GH|GITLAB)_.*(TOKEN|PAT)$|^(GITHUB|GH)_PAT|^(NPM_TOKEN|NPM_AUTH|NODE_AUTH_TOKEN|DOCKER|REGISTRY|GHCR|VERCEL_TOKEN|SENTRY_AUTH_TOKEN|NETLIFY_AUTH_TOKEN)|^RAILWAY_(API_)?TOKEN$")) then [5, "Source, registry and deploy tokens", $k]
         elif ($k | test("WEBHOOK")) then [7, "Webhook secrets", $k]
         elif ($k | test("(AUTH|SESSION|JWT|COOKIE|ENCRYPTION|CRYPTO|PAYLOAD|SIGNING|HMAC|CSRF|SALT|PEPPER).*(SECRET|KEY|SALT|PEPPER)|^(PAYLOAD|AUTH|NEXTAUTH|BETTER_AUTH|SESSION|JWT|APP|SECRET_KEY_BASE|DJANGO)_?SECRET")) then [6, "Session, signing and encryption secrets", $k]
-        else [8, "Other third-party keys and secrets (review)", $k] end)
+        else [8, "Other third-party keys and secrets (review)", $k] end) as $row
+      | $row + [if $row[0] >= 1 and $row[0] <= 8 then rotation_hint($e.key; $v; $iam) else "" end])
   | .[] | @tsv'
 
 # Fingerprint exactly what the checklist lists (groups 1-8): config and references are not secrets,
@@ -187,8 +214,8 @@ while IFS=$'\t' read -r pid pname ename sname; do
   fi
 
   jq -r "$group_jq" "$raw" >"$TMP/svc.rows"
-  while IFS=$'\t' read -r order group key; do
-    printf '%s\t%s\t%s\t%s\n' "$order" "$group" "$key" "$loc"
+  while IFS=$'\t' read -r order group key rhint; do
+    printf '%s\t%s\t%s\t%s\t%s\n' "$order" "$group" "$key" "$loc" "$rhint"
   done <"$TMP/svc.rows" >>"$ROWS"
 
   if [ -n "$FINGERPRINT" ] || [ -n "$VERIFY" ]; then
@@ -255,6 +282,14 @@ total="$(awk -F'\t' '$1 > 0 && $1 < 9' "$ROWS" | wc -l | tr -d ' ')"
   echo "create the new one, deploy it, then revoke the old one. Note that Railway paused deployments"
   echo "during the incident: if you can't deploy, revoking first takes the service down."
   echo
+  if awk -F'\t' '$1 >= 1 && $1 <= 8 && $5 != "" { found = 1 } END { exit !found }' "$ROWS"; then
+    echo "A note in brackets after a name says whether that provider lets the old and new credential"
+    echo "work at the same time: \`two live: yes\` (deploy the new one, then revoke), \`two live: grace\` (the"
+    echo "old one keeps working for a limited window after you roll it), \`hard cut\` (one credential: change"
+    echo "it and redeploy together). Source and steps: derail's \`references/breach-response.md\` section 4."
+    echo "No note means the provider is not in that table: check the provider's docs."
+    echo
+  fi
   if [ -n "$VERIFY" ] && [ -s "$STILL" ]; then
     echo "## Not rotated yet"
     echo
@@ -272,8 +307,10 @@ total="$(awk -F'\t' '$1 > 0 && $1 < 9' "$ROWS" | wc -l | tr -d ' ')"
     hint "$order"
     echo
     printf '%s\n' "$rows" | awk -F'\t' '
-      { if (!($3 in where)) { order[++n] = $3; where[$3] = $4 } else { where[$3] = where[$3] ", " $4 } }
-      END { for (i = 1; i <= n; i++) printf "- [ ] `%s` (%s)\n", order[i], where[order[i]] }'
+      { id = $3 SUBSEP $5
+        if (!(id in where)) { ids[++n] = id; name[id] = $3; note[id] = $5; where[id] = $4 } else { where[id] = where[id] ", " $4 } }
+      END { for (i = 1; i <= n; i++) { id = ids[i]
+              printf "- [ ] `%s` (%s)%s\n", name[id], where[id], (note[id] == "" ? "" : " [" note[id] "]") } }'
     echo
   done
   echo "## Not covered by this script"
