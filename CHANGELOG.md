@@ -52,9 +52,12 @@ First tagged release. Everything since the initial public commit.
   and Yarn 2+ (Plug'n'Play) projects.
 - `pg_migrate.sh` printed passwords given as URL query parameters or conninfo `key=value` pairs.
 - `pg_migrate.sh restore --role` aborted on a dump containing a foreign server.
+- The `tools` image could not run a yarn or pnpm `MIGRATION_COMMAND` without downloading the package
+  manager at migration time (Yarn 2+ also failed on its install state); Yarn 2+ `.yarnrc.yml` with
+  `yarnPath`, plugins or `patch:` dependencies broke the build, and Yarn 2+ pruning failed on `patch:`.
 
 ### Known issues
 
 - The breach-mode eval (`evals/railway-breach-nextjs-ai`) has not been benchmarked yet.
-- Yarn 2+: the `tools` image may not run a yarn-based `MIGRATION_COMMAND` (untested), and
-  `.yarnrc.yml` private registry settings are not applied in the deps stage.
+- Private npm registries work with npm and Yarn 2+ through the `NPM_TOKEN` build secret, but not with
+  pnpm, which ignores environment variables in a project `.npmrc`.
