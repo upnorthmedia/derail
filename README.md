@@ -253,6 +253,7 @@ assets/terraform/            bootstrap/ network/ platform/ modules/ live/example
 assets/docker/               Dockerfile.nextjs · Dockerfile.node · Dockerfile.python · dockerignore
 assets/app-snippets/         nextjs/ react-router/ payload/ better-auth/ webhooks/ db/
 assets/github-workflows/     terraform.yml (plan/apply) · deploy.yml (build → migrate → apply)
+assets/github/               dependabot.yml (weekly base-image digest + actions updates)
 scripts/                     breach_check · check_prereqs · railway_inventory · vercel_inventory · scan_codebase
                              pg_migrate (+ sql/) · blob_to_s3 · railway_bucket_to_s3 · railway_volume_to_s3
                              put_secrets · estimate_cost · lib/ · tests/
