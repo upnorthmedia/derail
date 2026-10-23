@@ -55,11 +55,11 @@ migration/
 
 | Script | Purpose | Inputs | Output |
 |---|---|---|---|
-| `check_prereqs.sh` | Verify terraform (>= 1.11) or tofu, aws CLI v2 + credentials, docker buildx, pg_dump/pg_restore/psql major, railway + vercel CLIs (logged in), node >= 20, jq, git | `--pg-major 18`, `--no-aws`, `--no-railway`, `--no-vercel`, `--offline` (= all three `--no-*`; no network calls) | Pass/warn/fail table; prints AWS **account id and region only**. Exit 1 on hard failures (terraform, aws, jq). With `--no-aws`/`--offline` only terraform/tofu can fail hard; missing CLIs are WARN. |
+| `check_prereqs.sh` | Verify terraform (>= 1.11) or tofu, aws CLI v2 + credentials, docker buildx, pg_dump/pg_restore/psql major, railway CLI (>= 5.27.0, WARN below: `connect --tunnel-only` 5.27.0, `tcp-proxy` 5.15.0, 5.x subcommands) + vercel CLI (logged in), node >= 20, jq, git | `--pg-major 18`, `--no-aws`, `--no-railway`, `--no-vercel`, `--offline` (= all three `--no-*`; no network calls) | Pass/warn/fail table; prints AWS **account id and region only**. Exit 1 on hard failures (terraform, aws, jq). With `--no-aws`/`--offline` only terraform/tofu can fail hard; missing CLIs are WARN. |
 | `railway_inventory.sh` | Export a Railway project/environment: status, environment config, services, domains, volumes, buckets, per-service variables (classified), `railway config pull` (`.railway/railway.ts`), Postgres HA/PgBouncer/PITR status, usage | `--project <id-or-name> --environment production --out migration/inventory/railway [--secrets-dir migration/.secrets]` | `SUMMARY.md` services table + variable names by class; raw JSON in `raw/`; values in `.secrets/railway.<service>.env`; all CLI failures in `errors.log` (script continues) |
 | `vercel_inventory.sh` | Export a Vercel project: link, project inspect, `env ls` (Config vs Secret), `env pull` per environment, domains + DNS records, blob listing (if a token is available), copies `vercel.json` / `next.config.*` | `--project <name> --team <slug> [--repo .] --out migration/inventory/vercel` | `SUMMARY.md` with framework, node version, domains, crons, env names (Secret = cannot be exported, must be re-sourced), rewrites/redirects/headers, functions; pulled values in `.secrets/vercel.<env>.env` |
 | `scan_codebase.py` | Static scan of the app repo: package manager, node version, framework, Next.js specifics (`output: 'standalone'` present/missing, edge routes, middleware/proxy, ISR/revalidate, next/image, cacheHandler), Payload adapters, auth/ORM/driver libs, **queue/worker libraries** (celery, rq, bullmq, bee-queue, graphile-worker, pg-boss, sidekiq -> separate ECS worker service) vs **in-process schedulers** (node-cron, croner, bree, APScheduler -> every replica fires), webhook SDKs + routes, Vercel imports, env var references classified **secret / public_buildtime / config / platform** (webhook URLs and datastore connection strings count as secrets), platform markers, hard-coded platform hostnames, **port detection** (Dockerfile `EXPOSE`, `CMD`/`ENTRYPOINT` `--port N`/`-p N`/`:N`, Procfile, railway `startCommand`, `uvicorn --port`, code literals; recommends `container_port`), health endpoints, crons, commands, tests, Dockerfile metadata. Security/storage findings: **DB TLS verification disabled** (`rejectUnauthorized: false`, `sslmode=no-verify/disable`, `ssl=false`, `PGSSLMODE=disable` -> verify-full with the RDS CA), **Twilio `validateRequest(req.url)`** (wrong URL behind CloudFront/ALB), **local filesystem writes** (`UPLOAD_DIR`, `/data`, `/mnt`, `fs.writeFile`, `createWriteStream`, `open(..., "w")`, `shutil.copyfileobj`, `aiofiles.open`, `Path().write_*` -> Railway volume -> S3/EFS decision). The "no Dockerfile" flag is platform-aware (Vercel built it / Railway Railpack-Nixpacks / neutral) | `python3 scan_codebase.py <repo> --out migration/inventory/codebase.json --md migration/inventory/CODEBASE.md [--json-only] [--vercel-node 24 \| --vercel-node migration/inventory/vercel/SUMMARY.md]` | JSON + Markdown with a prioritized **Migration flags** section and an env classification table. `--vercel-node` warns when `.nvmrc`/`engines.node` disagree with the Node version Vercel runs. Skips `node_modules/.git/.next/dist/build/...`; `.env*` files contribute names only |
-| `pg_migrate.sh` + `sql/` | Railway Postgres -> RDS/Aurora. `preflight` (versions incl. `SHOW server_version_num`, size, extensions + availability on target, tables without PK), `dump` (`-Fd -j4 --compress=zstd --no-owner --no-privileges --no-subscriptions --no-publications --quote-all-identifiers`, `PGSSLMODE=require`, counts/checksums alongside; `--exclude-table-data PATTERN` repeatable, recorded in `meta.json` and skipped by verify), `restore` (create DB, pre-create extensions as master, `pg_restore -j --no-owner --no-privileges --no-comments [--role]` with a TOC filter for pre-created schemas/extensions, `ANALYZE`, counts/checksums/sequences/extensions diff -> `VERIFY: OK` / `MISMATCH`; prints a PostGIS `spatial_ref_sys` note and a hint when that table conflicts), `verify`, `roles` (renders `sql/app_roles.sql.tpl`). `--pg-major-check` exits 1 before doing anything when `pg_dump` is older than the source server and names the client version to install | `SRC_URL`, `TGT_URL` env vars (required); `--target-db`, `--jobs`, `--role app_owner`, `--clean`, `--exclude-table-data 'spatial_ref_sys'`, `--pg-major-check`, `--dry-run`, `--out migration/db` | Dump directory, logs, `counts.*`/`sums.*` files, exit 1 on mismatch |
+| `pg_migrate.sh` + `sql/` | Railway Postgres -> RDS/Aurora. `preflight` (versions incl. `SHOW server_version_num`, size, extensions + availability on target, tables without PK), `dump` (`-Fd -j4 --compress=zstd --no-owner --no-privileges --no-subscriptions --no-publications --quote-all-identifiers`, `PGSSLMODE=require`, counts/checksums alongside; `--exclude-table-data PATTERN` repeatable, recorded in `meta.json` and skipped by verify), `restore` (create DB, pre-create extensions as master, `pg_restore -j --no-owner --no-privileges --no-comments [--role]` with a TOC filter for pre-created schemas/extensions, `ANALYZE`, counts/checksums/sequences/extensions diff -> `VERIFY: OK` / `MISMATCH`; prints a PostGIS `spatial_ref_sys` note and a hint when that table conflicts), `verify`, `roles` (renders `sql/app_roles.sql.tpl`). `audit` (read-only, `SRC_URL` only: roles and attributes, memberships, SECURITY DEFINER functions, triggers, event triggers, rules, extensions, schemas, object owners, FDW servers/user mappings, publications/subscriptions, live connections -> `<out>/db-audit-<stamp>.md` with a sign-off checklist; names, counts and definition hashes only, never row data, passwords, bodies or query text). `--pg-major-check` exits 1 before doing anything when `pg_dump` is older than the source server and names the client version to install | `SRC_URL`, `TGT_URL` env vars (required; `audit` needs `SRC_URL` only); `--target-db`, `--jobs`, `--role app_owner`, `--clean`, `--exclude-table-data 'spatial_ref_sys'`, `--pg-major-check`, `--dry-run`, `--out migration/db` | Dump directory, logs, `counts.*`/`sums.*` files, exit 1 on mismatch |
 | `sql/rowcounts.sql`, `sql/checksums.sql` | Exact row counts and md5 per table (ordered by PK), all user schemas; **extension-owned tables** (`pg_depend` `deptype = 'e'`, e.g. PostGIS `spatial_ref_sys`) are excluded because `CREATE EXTENSION` recreates them; run both sides with `PGTZ=UTC` and diff | `psql "$URL" -X -At -f ...` | `schema.table\|value` lines |
 | `sql/sequences_check.sql`, `sql/sequences_fix.sql` | Detect / fix sequences behind `max(column)` (needed after logical replication or partial loads); extension-owned sequences excluded from the check | `psql -f` | rows / `setval` |
 | `sql/extensions.sql` | Installed extensions with version and schema | `psql -f` | `extname\|version\|schema` |
@@ -86,6 +86,7 @@ python3 scripts/estimate_cost.py --tier standard --railway-monthly 48 [--worker-
 # database (SRC_URL from `railway connect postgres --tunnel-only`, Railway CLI >= 5.27.0; TGT_URL from Terraform outputs + Secrets Manager)
 export SRC_URL TGT_URL                      # set them with `read -rs`, never on the command line
 scripts/pg_migrate.sh preflight --pg-major-check
+scripts/pg_migrate.sh audit                  # read-only; review + sign off migration/db/db-audit-*.md before the final dump (breach mode: required)
 scripts/pg_migrate.sh dump --jobs 4 [--exclude-table-data 'spatial_ref_sys']   # PostGIS: the extension refills it
 APP_RW_PASSWORD=... APP_MIGRATE_PASSWORD=... scripts/pg_migrate.sh roles --target-db app
 scripts/pg_migrate.sh restore --target-db app --role app_owner
@@ -113,11 +114,22 @@ scripts/breach_check.sh --project my-app --verify migration/.secrets/railway.bur
 ```bash
 bash scripts/tests/test_breach_tools.sh                          # bash from PATH
 BASH_UNDER_TEST=/bin/bash /bin/bash scripts/tests/test_breach_tools.sh   # macOS bash 3.2
+bash scripts/tests/test_inventory_cli_compat.sh
+bash scripts/tests/test_check_prereqs.sh
+bash scripts/tests/test_pg_audit.sh                              # needs docker + psql; SKIPs without them
 ```
 
-Runs `breach_check.sh`, `railway_inventory.sh` and `put_secrets.sh --dry-run` against a stand-in
-`railway` CLI and asserts that grouping, fingerprints, verification and the exposed-value guard work and
-that no fixture value appears in any output. Needs jq; no Railway or AWS access.
+- `test_breach_tools.sh` runs `breach_check.sh`, `railway_inventory.sh` and `put_secrets.sh --dry-run`
+  against a stand-in `railway` CLI and asserts that grouping, fingerprints, verification and the
+  exposed-value guard work and that no fixture value appears in any output.
+- `test_inventory_cli_compat.sh` checks that `railway_inventory.sh` exports variables on both the current
+  CLI (`railway variable list`) and older ones that only have `railway variables` (4.16.1), and that on a
+  4.16.1-like CLI it never invokes `domain list`, `service list` or `environment list`.
+- `test_check_prereqs.sh` checks the Railway CLI version warning (old, boundary, new, unparseable).
+- `test_pg_audit.sh` runs `pg_migrate.sh audit` and `restore` against a throwaway `postgres:17` container
+  with planted roles, functions and triggers, and checks that no planted secret reaches any output.
+
+All need jq; none touch Railway or AWS.
 
 ## Migrations: the tools image and the deploy workflow
 
@@ -141,6 +153,13 @@ All three Dockerfile templates bake the RDS CA bundle at `/app/global-bundle.pem
 - `pg_migrate.sh restore` is re-runnable into a scratch database with `--clean`; without it a second
   run fails on existing tables (by design, to protect a live target).
 - `estimate_cost.py` uses list prices for us-east-1 and excludes data transfer; treat it as +/-15%.
+- `railway_inventory.sh` targets the current Railway CLI (5.x). It only runs a subcommand that
+  `railway <cmd> --help` lists, because older CLIs read an unknown subcommand as an argument (4.16.1 takes
+  `railway domain list` as "add the custom domain `list`"). On 4.16.1 the variable export still works
+  (via `railway variables`), but `service list`, `domain list`, `environment config`/`list`, `bucket list`,
+  `cron list`, `config pull`, `postgres ... status` and `usage projects` are skipped (logged as
+  `skipped: not in this CLI` in `errors.log`): service names then come only from `railway status --json`
+  and there is no `railway.ts`. Upgrade the CLI (`npm i -g @railway/cli`) before running the inventory.
 - `railway_volume_to_s3.sh --method files` depends on `railway volume files download`, which exists only
   in newer Railway CLI releases; older CLIs must use `--method scp` (requires `railway ssh` to work for the
   service, i.e. a running deployment and an SSH key linked to the account).
