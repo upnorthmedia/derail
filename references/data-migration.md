@@ -41,6 +41,7 @@ export SRC_URL='postgresql://postgres:<pw>@localhost:<port>/railway'
 export TGT_URL='postgresql://postgres:<master-pw>@<endpoint>:5432/postgres?sslmode=verify-full&sslrootcert=global-bundle.pem'
 
 scripts/pg_migrate.sh preflight --pg-major-check   # versions (fails early if pg_dump < server major), size, extensions, tables without PK
+scripts/pg_migrate.sh audit                         # read-only (SRC_URL only): roles, SECURITY DEFINER functions, triggers, event triggers, rules, extensions, FDWs, live sessions -> migration/db/db-audit-<stamp>.md to sign off
 scripts/pg_migrate.sh dump                          # -Fd -j4 zstd --no-owner --no-privileges --no-subscriptions --no-publications
 #   PostGIS: add --exclude-table-data spatial_ref_sys (the extension recreates those rows on the target)
 scripts/pg_migrate.sh roles --target-db app         # creates app_owner / app_migrate / app_rw (passwords from env, never echoed)
@@ -65,6 +66,10 @@ remove it in the dashboard under the service's Settings > Networking. `railway c
 when the service has no proxy. If a dump cannot use the tunnel, or you run logical replication (section
 3), re-create the proxy for that window only (`railway tcp-proxy create --port 5432 --service <postgres>`;
 read the new domain and port from `tcp-proxy list`) and delete it when the window closes.
+
+`dump` uses `--no-owner --no-privileges`, which drops ownership but not the objects themselves: every
+function, trigger, event trigger, rule and foreign server in the source is restored. `audit` lists them so a
+person can confirm each is the app's own; in breach mode the signed-off report is required before the final dump.
 
 Flag rationale: directory format is the only one that supports parallel `--jobs`; `--no-owner
 --no-privileges` strip Railway role references; `--no-subscriptions --no-publications` avoid dragging

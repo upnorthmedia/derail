@@ -193,7 +193,9 @@ Read `references/terraform-conventions.md` first. Then:
 3. **Dockerfile**: pick `assets/docker/Dockerfile.nextjs|node|python`, adapt build/start to the
    inventory (Railway start command / Procfile / package.json scripts), add one `ARG`+`ENV` per
    `NEXT_PUBLIC_*`/`VITE_*` variable, keep the RDS CA bundle lines, copy `dockerignore` to
-   `.dockerignore`. The Node/Next.js files have two targets: `runner` (what the service runs) and
+   `.dockerignore`. Base images are pinned by digest on one `FROM <image>:<tag>@sha256:... AS base`
+   line; to change the Node/Python version, change the tag and the digest together
+   (`docker buildx imagetools inspect <image:tag>`). The Node/Next.js files have two targets: `runner` (what the service runs) and
    `tools` (full dependencies for migrations, built as `<sha>-tools`); the migration task uses the tools
    image because the standalone runner cannot run `payload migrate`, `drizzle-kit`, `prisma` or
    `auth migrate`. Build locally if Docker is available and fix what fails.
@@ -228,7 +230,9 @@ Read `references/terraform-conventions.md` first. Then:
 Read `references/data-migration.md`. Produce `migration/DATA.md` with the exact commands for this app:
 source connection route (SSH tunnel preferred) and where the restore runs from (the optional
 `migration_host`, SSM-only, inside the VPC; the RDS endpoint is private), `pg_migrate.sh preflight
---pg-major-check | dump | roles | restore --target-db <db> --role app_owner | verify`, target DB/role
+--pg-major-check | audit | dump | roles | restore --target-db <db> --role app_owner | verify` (`audit`
+is read-only and lists every role, function, trigger and foreign server the dump would carry; in breach
+mode its signed-off report is required before the final dump), target DB/role
 names, extension list and blockers (TimescaleDB, unsupported versions; PostGIS needs
 `--exclude-table-data spatial_ref_sys`), the minimal-downtime decision (dump/restore under ~10 GB and
 >= 15 min tolerance; native logical replication otherwise, with the `wal_level=logical` + RDS egress
@@ -243,7 +247,8 @@ Fill `references/cutover-runbook-template.md` into `migration/RUNBOOK.md` with t
 hostnames, webhook/OAuth providers, DNS location and TTL plan, the rehearsal checklist, the minute-by-
 minute cutover sequence, rollback triggers and the data-loss exposure, and the day-1 / day-7 / day-14
 post-cutover tasks (rotation, decommissioning, cost verification). In breach mode, include the
-template's breach-mode lines (session secrets at the cutover minute, `breach_check.sh --verify` before
+template's breach-mode lines (session secrets at the cutover minute, the TCP proxy deleted before the
+first rehearsal and gone by cutover, the Day 1 canary credential, `breach_check.sh --verify` before
 decommissioning) and drop the Day 1-2 rotation items that already happened. The flip itself is two Terraform
 variables in one apply: `traffic_target = "aws"` and `crons_enabled = true`; rollback is the reverse.
 If DNS moves to Route 53, delegation happens at T-7 with `old_platform_records` still pointing at the
