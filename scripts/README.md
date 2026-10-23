@@ -117,6 +117,7 @@ BASH_UNDER_TEST=/bin/bash /bin/bash scripts/tests/test_breach_tools.sh   # macOS
 bash scripts/tests/test_breach_hints.sh
 bash scripts/tests/test_inventory_cli_compat.sh
 bash scripts/tests/test_check_prereqs.sh
+bash scripts/tests/test_gitignore.sh                             # needs git
 bash scripts/tests/test_pg_audit.sh                              # needs docker + psql; SKIPs without them
 ```
 
@@ -130,10 +131,13 @@ bash scripts/tests/test_pg_audit.sh                              # needs docker 
   CLI (`railway variable list`) and older ones that only have `railway variables` (4.16.1), and that on a
   4.16.1-like CLI it never invokes `domain list`, `service list` or `environment list`.
 - `test_check_prereqs.sh` checks the Railway CLI version warning (old, boundary, new, unparseable).
+- `test_gitignore.sh` checks `lib/gitignore.sh`: the entry is relative to the repository root and added
+  once, the root itself and directories outside it are never added, and outside a repository the current
+  directory stands in for the root.
 - `test_pg_audit.sh` runs `pg_migrate.sh audit` and `restore` against a throwaway `postgres:17` container
   with planted roles, functions and triggers, and checks that no planted secret reaches any output.
 
-All need jq; none touch Railway or AWS.
+All but `test_gitignore.sh` need jq; none touch Railway or AWS.
 
 ## Migrations: the tools image and the deploy workflow
 
