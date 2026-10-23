@@ -108,6 +108,8 @@ FP_NEW="$TMP/fingerprints.tsv"  # fingerprint<TAB>location/KEY
 : >"$FP_NEW"
 STILL="$TMP/still-exposed.tsv"  # location/KEY
 : >"$STILL"
+SHORT="$TMP/short.tsv"          # location/KEY of listed secrets too short to fingerprint
+: >"$SHORT"
 SKIPPED_CONFIG=0
 FAILED=0
 
@@ -235,6 +237,11 @@ while IFS=$'\t' read -r pid pname ename sname; do
     fp_entries "$TMP/vars.export.json" | while IFS=$'\t' read -r key fp; do
       printf '%s\t%s/%s\n' "$fp" "$loc" "$key"
     done >>"$FP_NEW"
+    # Secrets below FP_MIN_LENGTH get no fingerprint, so neither --verify nor put_secrets.sh can see
+    # them: name them for a check by hand.
+    jq -r --argjson min "$FP_MIN_LENGTH" --arg loc "$loc" '
+      to_entries[] | select((.value | tostring | length) > 0 and (.value | tostring | length) < $min)
+      | "\($loc)/\(.key)"' "$TMP/vars.export.json" >>"$SHORT"
     rm -f "$TMP/vars.export.json"
   fi
   rm -f "$raw"
@@ -330,6 +337,11 @@ total="$(awk -F'\t' '$1 > 0 && $1 < 9' "$ROWS" | wc -l | tr -d ' ')"
   echo "  Railway dashboard, find the sealed ones, and rotate them at their provider."
   echo "- **Railway account and project tokens** you created for CI. Revoke them in Railway's account settings and"
   echo "  update the CI secret store that holds them."
+  if [ -s "$SHORT" ]; then
+    echo "- **Secrets too short to fingerprint** (under $FP_MIN_LENGTH characters): \`--verify\` and \`put_secrets.sh\`"
+    echo "  cannot see them, so confirm by hand that each was rotated:"
+    sort -u "$SHORT" | sed 's/^/  - `/; s/$/`/'
+  fi
   echo "- **Copies elsewhere.** The same key in GitHub Actions secrets, a laptop \`.env\`, or another host is the"
   echo "  same key. Rotating means every copy."
   if [ -n "$FINGERPRINT" ]; then
@@ -342,6 +354,9 @@ total="$(awk -F'\t' '$1 > 0 && $1 < 9' "$ROWS" | wc -l | tr -d ' ')"
 [ -s "$ERRLOG" ] || rm -f "$ERRLOG"
 echo "checklist: $OUT ($total variables to rotate, $FAILED unreadable)"
 [ -n "$FINGERPRINT" ] && echo "fingerprints: $FINGERPRINT ($(wc -l <"$FINGERPRINT" | tr -d ' ') values, mode 600; keep it out of git)"
+if [ -s "$SHORT" ]; then
+  echo "not fingerprinted (under $FP_MIN_LENGTH characters), confirm by hand that each was rotated: $(sort -u "$SHORT" | tr '\n' ' ')"
+fi
 if [ -n "$VERIFY" ]; then
   still="$(wc -l <"$STILL" | tr -d ' ')"
   if [ "$still" -gt 0 ]; then

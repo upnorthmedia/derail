@@ -94,7 +94,7 @@ write_web "sk-proj-FIXTUREopenai0000000000001" "FIXTUREpostmark00000000000001"
 cat >"$T/fixture/vars/Postgres.json" <<EOF
 {"DATABASE_URL":"postgresql://postgres:$FX_PGPASS@postgres.railway.internal:5432/railway",
  "DATABASE_PUBLIC_URL":"postgresql://postgres:$FX_PGPASS@proxy.rlwy.net:12345/railway",
- "PGPASSWORD":"$FX_PGPASS","PGPORT":"5432","PGUSER":"postgres"}
+ "PGPASSWORD":"$FX_PGPASS","PGPORT":"5432","PGUSER":"postgres","REDIS_PASSWORD":"FIXTURE"}
 EOF
 FIXTURE_VALUES="FIXTURE|sk-proj-|sk_live_|whsec_|ghp_|$FX_STRIPE|$FX_WHSEC|$FX_GHP|$FX_PGPASS"
 
@@ -124,6 +124,9 @@ check "no value in checklist, stdout, stderr or fingerprints" '! grep -Eq "$FIXT
 
 rc=0; "$SH" "$SCRIPTS/breach_check.sh" --out v1.md --verify secrets/railway.burned.sha256 >verify1.txt 2>&1 || rc=$?
 check "verify before rotation exits 1" '[ "$rc" -eq 1 ]'
+check "a secret too short to fingerprint is not in the fingerprint file" '! grep >/dev/null "/REDIS_PASSWORD$" secrets/railway.burned.sha256'
+check "the checklist names it for a check by hand" 'awk "/^## Not covered/,0" exposure.md | grep >/dev/null "shop/production/Postgres/REDIS_PASSWORD"'
+check "--verify names it too" 'grep >/dev/null "REDIS_PASSWORD" verify1.txt && grep >/dev/null "by hand" verify1.txt'
 check "verify lists the unrotated AI key" 'grep -q "shop/production/web/OPENAI_API_KEY" v1.md'
 
 write_web "sk-proj-FIXTUREopenaiROTATED00000002" "FIXTUREpostmark00000000000001"
