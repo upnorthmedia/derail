@@ -83,7 +83,7 @@ python3 scripts/scan_codebase.py . --out migration/inventory/codebase.json --md 
   --vercel-node migration/inventory/vercel/SUMMARY.md     # optional: compare with the Node version Vercel runs
 python3 scripts/estimate_cost.py --tier standard --railway-monthly 48 [--worker-tasks 1 --worker-spot] [--kms] [--s3-gb 50]
 
-# database (SRC_URL from `railway connect postgres --tunnel-only`; TGT_URL from Terraform outputs + Secrets Manager)
+# database (SRC_URL from `railway connect postgres --tunnel-only`, Railway CLI >= 5.27.0; TGT_URL from Terraform outputs + Secrets Manager)
 export SRC_URL TGT_URL                      # set them with `read -rs`, never on the command line
 scripts/pg_migrate.sh preflight --pg-major-check
 scripts/pg_migrate.sh dump --jobs 4 [--exclude-table-data 'spatial_ref_sys']   # PostGIS: the extension refills it

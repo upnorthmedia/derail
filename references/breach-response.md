@@ -23,6 +23,8 @@ or leaked some other way. An ordinary migration never loads this file, and none 
 | Session and auth secrets | identical through cutover, rotated a week later with a re-login notice | rotated **at the cutover minute**; users log in again inside the downtime that already exists (section 5) |
 | `put_secrets.sh` | no fingerprint file, no check | `migration/.secrets/railway.burned.sha256` sits next to the env file, so any exposed value is refused |
 | Database password | rotated after cutover | rotated now, like every other exposed credential (section 6) |
+| Railway TCP proxy (`DATABASE_PUBLIC_URL`) | deleted on Day 7 after cutover | deleted after the password rotation, before the first rehearsal dump; dumps use `railway connect postgres --tunnel-only`; re-created only for a dump or replication window, gone by cutover T+15 (data-migration.md section 2) |
+| Between cutover and decommissioning | idle services, no extra step | Day 1: a canary credential planted in the old Railway environment, removed with the services; token kept active a few weeks longer (runbook section 6) |
 | Before decommissioning | cost and traffic checks | `breach_check.sh --verify` passes, i.e. nothing on Railway still holds an exposed value |
 
 ## 2. Order of operations
@@ -179,15 +181,37 @@ on the internet could use it.
 - Rotate the database password with the other "rotate now" rows, before the first rehearsal dump, then
   update the Postgres service's password variables so `${{Postgres.*}}` references follow. Check
   Railway's docs for the template version before doing this in production.
-- `pg_dump` copies roles' objects, functions and triggers faithfully, including any an intruder added.
-  `pg_migrate.sh preflight` lists roles and event triggers; flag anything unexpected in BREACH.md as an
-  open question rather than migrating it silently.
+- Then delete the Railway TCP proxy (`railway tcp-proxy list --service <postgres>`, `railway tcp-proxy
+  delete <id>`; CLI >= 5.15.0) so the rotated password is not reachable from the internet either.
+  Dumps go over `railway connect postgres --tunnel-only` (CLI >= 5.27.0), which tunnels over SSH when no
+  proxy exists. Re-create the proxy only for a window that needs it (logical replication, a client that
+  cannot tunnel) and delete it again; the runbook deletes any remaining proxy at T+15
+  (`references/data-migration.md` section 2).
+- `pg_dump` copies functions, triggers, event triggers, rules, schemas, foreign servers and user mappings
+  faithfully, including any an intruder added (roles, grants, publications and subscriptions are not
+  copied by `dump`'s flags). Run `SRC_URL=... scripts/pg_migrate.sh audit` after rotating the password and
+  before the first rehearsal dump. It is read-only and writes `migration/db/db-audit-<stamp>.md`: login
+  roles and attributes, memberships, SECURITY DEFINER functions, triggers, event triggers, rules,
+  extensions, schemas and owners, foreign servers / user mappings, publications / subscriptions and who is
+  connected right now. Record anything unexplained in BREACH.md as an open question, remove it on the
+  source (or keep it out of the dump), re-run the audit and diff the two reports (function definitions
+  are identified by a hash), and complete its sign-off checklist before the final dump.
+- A password change does not end sessions that are already open: authentication happens when a client
+  connects. If the audit shows a connection you cannot account for, end it (`SELECT
+  pg_terminate_backend(pid) ...` as the admin user) after rotating.
+- A foreign-server user mapping stores another system's credential, and `pg_dump` writes it to the dump
+  in plain text: treat that credential as exposed and keep dump directories out of git and shared drives.
 
 ## 7. What not to do
 
 - Never read old values back to compare them; fingerprints exist so nobody has to.
 - Never keep a leaked secret in a "previous secrets" list after traffic resumes.
-- Never pull existing private-registry images if registry credentials were among the exposed values;
-  build from source (the generated workflows already do).
+- Never pull existing private-registry images if registry credentials were among the exposed values:
+  whoever held the token could have pushed over a tag you still deploy. Build from source (the
+  generated `deploy.yml` builds `runner`/`tools` from the checked-out commit and pushes only to the new
+  ECR repository; the Terraform modules run only images from that repository). Base images in
+  `assets/docker/Dockerfile.*` are pinned by digest, so a moved tag cannot change a build. Revoke the
+  registry token at the registry itself, and do not copy an old private image into ECR to "save a
+  rebuild".
 - Nothing in this file changes the non-negotiables: no values in chat or files, nothing applied,
   nothing deleted on the source platform by the agent.
